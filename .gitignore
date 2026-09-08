@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+*.env.local
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+
+# Logs
+logs/*.log
+logs/
+
+# Generated artifacts (reports, charts, workspace)
+reports/*.md
+reports/charts/*
+workspace/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (keep sample datasets tracked; ignore user uploads)
+datasets/*.csv
+!datasets/sales.csv
+!datasets/ecommerce.csv
+!datasets/financial.csv
