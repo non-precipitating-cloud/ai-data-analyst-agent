@@ -1,11 +1,24 @@
 # AI Data Analyst Agent
 
-一个在本地 CLI 运行的数据分析智能体。用户提供 CSV / Excel / JSON 数据文件 + 自然语言需求，
-Agent 自主规划、调用工具执行真实分析、根据中间结果循环决策，最终生成 Markdown 分析报告。
+一个基于 **LangGraph** 的本地 AI 数据分析智能体：用户提供 CSV / Excel / JSON 数据文件 + 一句自然语言需求，
+Agent 自主规划、自主调用工具执行真实分析、根据中间结果循环决策，最终生成结构化、可追溯的 Markdown 分析报告。
 
-> 当前状态：**Phase 2–13 已完成**。核心链路「任务理解 → Skill 选择 → 数据画像 → 规划 →
-> 工具循环 → 洞察 → 报告」已跑通，含 Python 沙箱、SQL 只读守卫、RAG（pgvector）、
-> Agent Skills、MCP（stdio）、PostgreSQL 落库 + Redis 会话、结构化可信报告。
+> 当前状态：**Phase 1–13.3 已完成**。完整实现「LangGraph Agent + Tool Calling + Skills + RAG + MCP +
+> PostgreSQL + Redis + Docker」，**121 个测试全绿**，真实 DeepSeek 多轮自主分析跑通并落库。
+
+---
+
+## 项目亮点
+
+- 🤖 **LangGraph 自主 Agent**：任务理解 → Skill 选择 → 数据画像 → 规划 → Tool Calling 循环 → 洞察 → 报告，LLM 根据中间结果动态决定下一步，非固定流程。
+- 🔧 **Tool Calling**：11 个分析工具（文件读取 / Python 沙箱 / SQL 只读 / 统计 / 相关性 / 异常检测 / 图表 / RAG / 报告），工具失败自动回传 LLM 换方法重试。
+- 🧩 **Agent Skills**：7 个可复用分析方法（销售 / 财务 / 异常 / 相关 / 清洗等），LLM 语义选择 + 关键词回退，按需注入上下文。
+- 🔍 **RAG**：PostgreSQL + pgvector 向量知识库，检索数据分析方法论辅助决策，不可用时自动回退内存实现。
+- 🔌 **MCP（Model Context Protocol）**：stdio 标准化暴露 7 个分析能力，与本地工具动态共存（`mcp__` 前缀区分）。
+- 🗄️ **PostgreSQL + Redis**：业务数据落库（6 表）+ 会话/缓存，全程优雅降级（不可用仅告警不中断）。
+- 🐳 **Docker 容器化**：`docker compose up -d` 一键启动 agent + postgres + redis。
+- 🛡️ **安全执行**：Python AST 沙箱 + SQL 只读守卫 + Agent 防死循环。
+- ✅ **121 个测试全部通过**，真实 Demo 端到端跑通。
 
 ---
 
@@ -26,11 +39,52 @@ PostgreSQL + pgvector · Redis · MCP · Docker
 
 ## 系统架构
 
+### 总体架构
+
+```mermaid
+flowchart LR
+    User[用户 CLI] --> Agent[LangGraph Agent]
+    Agent --> Tools[11 个本地 Tools]
+    Agent --> Skills[Agent Skills]
+    Agent --> RAG[RAG 知识库]
+    Agent --> MCPC[MCP Client]
+    Agent --> DB[(PostgreSQL)]
+    Agent --> RD[(Redis)]
+    MCPC -->|stdio| MCPS[MCP Server]
+    RAG --> PG[(pgvector)]
+    Tools --> DB
+    DB --> PG
 ```
-用户输入 → Task Understanding → Skill Selection → Dataset Profiler → Planner
-            → Tool Calling 循环（LLM 选工具 → 执行 → 观察 → 决定下一步）
-            → Insight → Report
-          PostgreSQL（落库） + Redis（会话/缓存） + RAG + MCP + Tools
+
+### LangGraph Agent 工作流
+
+```mermaid
+flowchart TD
+    A[用户输入] --> B[Task Understanding]
+    B --> C[Skill Selection]
+    C --> D[Dataset Profiler]
+    D --> E[Planner]
+    E --> F[Agent 决策]
+    F -->|需要工具| G[Tool Calling]
+    G --> H[观察结果]
+    H --> F
+    F -->|信息足够| I[Insight]
+    I --> J[Report 报告]
+```
+
+### RAG / PostgreSQL / Redis / MCP 关系
+
+```mermaid
+flowchart LR
+    K[knowledge/*.md] --> L[Loader + Chunking]
+    L --> M[Embedding]
+    M --> PG[(pgvector)]
+    PG --> R[Retriever]
+    R --> A2[RAG 检索]
+    A2 --> LLM[LLM]
+    A2 --> DB2[(PostgreSQL 落库)]
+    A2 --> RD2[(Redis 会话/缓存)]
+    MCPS2[MCP Server stdio] -->|动态发现| A2
 ```
 
 ## 环境要求
@@ -92,15 +146,30 @@ python -m venv .venv
 | `EMBEDDING_*` | 可选 | 填 `EMBEDDING_API_KEY` 用真实语义向量，留空用本地哈希向量 |
 | `MAX_STEPS` 等 | 可选 | Agent 控制参数，保持默认 |
 
-## Docker 启动
+## Docker 启动（全栈）
+
+一键启动完整系统：`agent`（应用）+ `postgres`（pgvector）+ `redis`。
 
 ```bash
-docker compose up -d                            # 启动 PostgreSQL(pgvector) + Redis
-docker compose ps                               # 查看状态（postgres healthy / redis running）
-docker exec analyst-redis redis-cli ping        # 应返回 PONG
+# 1. 配置环境变量（首次）
+cp .env.example .env          # 填入 LLM_API_KEY
+
+# 2. 启动全部服务（agent 自动等待 postgres healthy）
+docker compose up -d
+docker compose ps             # 确认 postgres healthy / redis + agent running
+
+# 3. 初始化数据库表（首次一次）
+docker compose exec agent python -m src.db.init_db
+
+# 4. 运行 Agent（交互式）
+docker compose exec agent python main.py
 ```
 
-> 数据卷 `pgdata` 持久化；**不要**执行 `docker compose down -v`（会删除数据）。
+> - 容器内通过 Compose 服务名 `postgres` / `redis` 连接（非 localhost），无需改 .env。
+> - 报告写入 `reports_data` 数据卷（持久化），可用 `docker cp analyst-agent:/app/reports/xxx.md .` 取回。
+> - 宿主机 venv 方式（上方「快速开始」）仍可用，两者互不影响。
+> - 数据卷持久化；**不要**执行 `docker compose down -v`（会删除数据）。
+> - 已知限制：`python:3.11-slim` 镜像未内置中文字体，容器内图表中文标签会显示为方框（非阻塞，后续优化）。
 
 ## 示例数据
 
@@ -109,6 +178,27 @@ docker exec analyst-redis redis-cli ping        # 应返回 PONG
 | `datasets/sales.csv` | 2160 行 × 12 列，月度×地区×产品销售，含 2025 下滑、华东大跌、异常值、销售-利润强相关 |
 | `datasets/ecommerce.csv` | 4000 行订单，含退换货 / 评分 / 支付方式 |
 | `datasets/financial.csv` | 720 行，部门×科目收入/支出 |
+
+## 真实 Demo 展示
+
+输入 `datasets/sales.csv` + 需求「分析销售额下降的主要原因，找出下降最严重的地区和产品」，Agent 自主完成：
+
+```
+[Skill]  已选择 Skills: sales-analysis, anomaly-detection, correlation-analysis
+[Agent]  → read_dataset → profile_dataset → execute_python（年度/地区/品类/交叉归因）
+         → detect_outliers（IQR 检出 248 个异常值）→ calculate_correlation
+         → generate_chart（地区/品类/产品柱状图）→ save_report
+```
+
+核心结论（全部来自真实工具结果，非编造）：
+
+- 销售额同比下降 **18.58%**（3.368 亿 → 2.742 亿）
+- 下降最严重地区：**华东 -32.7%**，贡献整体降幅 **41.2%**
+- 下降最严重品类：**服装 -37.4%**（男士夹克 / 运动鞋 / 女士连衣裙）
+- 异常值：IQR 检出 **248 个**（11.48%），多为企业客户大额批量订单
+- 生成 3 张图表 + 17 章节 Markdown 报告，并落库到 PostgreSQL（task / agent_run / tool_calls / analysis_results / reports）
+
+> 报告样例：`reports/analysis_report_*.md`；图表：`reports/charts/*.png`
 
 ## 运行测试
 
@@ -122,19 +212,21 @@ docker exec analyst-redis redis-cli ping        # 应返回 PONG
 ai-data-analyst-agent/
 ├── main.py                  # 入口
 ├── pyproject.toml
+├── Dockerfile               # 应用容器化
+├── .dockerignore
+├── docker-compose.yml       # agent + PostgreSQL(pgvector) + Redis
+├── docker/init.sql
 ├── .env.example
 ├── scripts/generate_sample_data.py
 ├── scripts/ingest_knowledge.py   # 知识库导入
 ├── datasets/                # 示例数据
 ├── knowledge/               # 知识库 Markdown 文档（7 篇）
-├── reports/                 # 报告 + charts/ 图表
-├── docker-compose.yml       # PostgreSQL(pgvector) + Redis
-├── docker/init.sql
+├── reports/                 # 报告 + charts/ 图表（运行产物，gitignore）
 ├── src/
 │   ├── config/settings.py   # pydantic-settings 配置
 │   ├── logging_config.py
 │   ├── llm/factory.py       # OpenAI 兼容 ChatModel 工厂
-│   ├── agent/               # LangGraph：state / prompts / graph / nodes
+│   ├── agent/               # LangGraph：state / prompts / graph / nodes / report_builder
 │   ├── tools/               # 文件 / Python 沙箱 / SQL 只读 / 统计 / 图表 / RAG / 报告
 │   ├── rag/                 # embeddings / 向量存储 / loader / retriever
 │   ├── skills/              # Agent Skills：*/SKILL.md + loader/selector
@@ -213,7 +305,15 @@ ai-data-analyst-agent/
   报告只引用实际生成的图表，虚假图表引用被 `sanitize_report()` 自动剔除。
 - **质量检查** `validate_report()`：检查非空、章节、占位符、JSON 残留、虚假图表引用（失败仅告警不中断）。
 
+## 简历项目描述（可直接放入 BOSS 直聘）
+
+> **AI 数据分析智能体（LangGraph + MCP + RAG + PostgreSQL）**
+>
+> 基于 LangGraph 构建的本地 AI 数据分析智能体，用户提供数据文件 + 自然语言需求，Agent 自主规划、调用 11 个工具（含 Python 沙箱、SQL 只读、统计、图表、RAG 检索）循环执行真实分析，最终生成结构化可追溯的 Markdown 报告。
+> 技术亮点：Agent 自主决策循环（非固定流程）、可复用 Agent Skills、pgvector 向量知识库 RAG、MCP（stdio）标准化工具、PostgreSQL 六表业务落库 + Redis 会话缓存、Docker 一键启动、Python AST 沙箱 + SQL 只读守卫。121 个测试全绿，真实 DeepSeek 多轮分析端到端跑通。
+
 ## 后续路线
 
-- 应用容器化（Dockerfile）—— 当前应用在宿主机 venv 运行，仅基础设施（PG/Redis）容器化。
-- README 补充真实运行截图与更完整的 Demo 说明。
+- 图表中文字体（容器 `python:3.11-slim` 未内置中文字体，图表中文标签显示方框）。
+- README 补充真实运行截图。
+- CI/CD（可选）。

@@ -23,5 +23,26 @@ services:
     ports:
       - "6379:6379"
 
+  agent:
+    build: .
+    container_name: analyst-agent
+    # 容器内通过 Compose 服务名访问 PostgreSQL / Redis（不能用 localhost）
+    environment:
+      DATABASE_URL: postgresql+psycopg://analyst:analyst@postgres:5432/analyst
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - reports_data:/app/reports
+    stdin_open: true
+    tty: true
+    restart: "no"
+
 volumes:
   pgdata:
+  reports_data:

@@ -1,0 +1,36 @@
+# 版本控制 / 环境
+.git
+.gitignore
+.venv
+venv
+env/
+
+# 密钥（绝不能进镜像）
+.env
+.env.*
+!.env.example
+
+# Python 缓存 / 构建产物
+**/__pycache__/
+*.py[cod]
+*.egg-info
+.eggs
+build/
+dist/
+
+# 运行时产物
+reports/
+logs/
+workspace/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / 其他
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/

@@ -93,21 +93,22 @@ class PgVectorStore:
         metadatas = metadatas or [{}] * len(texts)
         embeddings = self.embedder.embed_documents(texts)
         with self.engine.begin() as conn:
-            for text, meta, emb in zip(texts, metadatas, embeddings):
+            for chunk, meta, emb in zip(texts, metadatas, embeddings):
                 conn.execute(
                     text(
                         f"""
                         INSERT INTO {_TABLE}
                             (doc_id, category, chunk_index, content, metadata, embedding)
                         VALUES
-                            (:doc_id, :category, :chunk_index, :content, :metadata::jsonb, :embedding::vector)
+                            (:doc_id, :category, :chunk_index, :content,
+                             CAST(:metadata AS jsonb), CAST(:embedding AS vector))
                         """
                     ),
                     {
                         "doc_id": meta.get("source", ""),
                         "category": meta.get("category", ""),
                         "chunk_index": meta.get("chunk_index", 0),
-                        "content": text,
+                        "content": chunk,
                         "metadata": json.dumps(meta, ensure_ascii=False),
                         "embedding": _vec_to_str(emb),
                     },
@@ -120,9 +121,9 @@ class PgVectorStore:
             rows = conn.execute(
                 text(
                     f"""
-                    SELECT content, metadata, 1 - (embedding <=> :q::vector) AS similarity
+                    SELECT content, metadata, 1 - (embedding <=> CAST(:q AS vector)) AS similarity
                     FROM {_TABLE}
-                    ORDER BY embedding <=> :q::vector
+                    ORDER BY embedding <=> CAST(:q AS vector)
                     LIMIT :k
                     """
                 ),

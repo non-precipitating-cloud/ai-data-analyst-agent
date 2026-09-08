@@ -88,3 +88,29 @@ def test_retriever_auto_ingest_when_empty() -> None:
 
 def test_vec_to_str_pgvector_format() -> None:
     assert _vec_to_str([1.0, 0.5, -0.25]) == "[1.000000,0.500000,-0.250000]"
+
+
+def test_pgvector_add_texts_and_search() -> None:
+    """回归测试：PgVectorStore.add_texts 不应因变量遮蔽报错（需真实 PG，不可用则跳过）。"""
+    import pytest
+
+    from src.config.settings import get_settings
+    from src.rag.embeddings import get_embedder
+    from src.rag.vector_store import PgVectorStore
+
+    try:
+        store = PgVectorStore(get_embedder(), get_settings().database_url)
+    except Exception:  # noqa: BLE001
+        pytest.skip("PostgreSQL + pgvector 不可用")
+
+    store.clear()
+    try:
+        n = store.add_texts(
+            ["苹果手机销量", "香蕉水果销量"],
+            [{"category": "a"}, {"category": "b"}],
+        )
+        assert n == 2
+        results = store.similarity_search("手机", k=1)
+        assert results[0]["text"] == "苹果手机销量"
+    finally:
+        store.clear()
