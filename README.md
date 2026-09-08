@@ -3,29 +3,68 @@
 一个在本地 CLI 运行的数据分析智能体。用户提供 CSV / Excel / JSON 数据文件 + 自然语言需求，
 Agent 自主规划、调用工具执行真实分析、根据中间结果循环决策，最终生成 Markdown 分析报告。
 
-> 当前状态：**Phase 2–11 已完成**。核心链路「任务理解 → Skill 选择 → 数据画像 → 规划 →
-> 工具循环 → 洞察 → 报告」已跑通，含 Python 沙箱、SQL 只读守卫、RAG 知识库检索（pgvector）、
-> 可复用 Agent Skills、MCP（stdio）、PostgreSQL 业务落库 + Redis 会话/缓存（优雅降级）、
-> 结构化可信报告（图表真实性校验 + 质量检查）。
+> 当前状态：**Phase 2–13 已完成**。核心链路「任务理解 → Skill 选择 → 数据画像 → 规划 →
+> 工具循环 → 洞察 → 报告」已跑通，含 Python 沙箱、SQL 只读守卫、RAG（pgvector）、
+> Agent Skills、MCP（stdio）、PostgreSQL 落库 + Redis 会话、结构化可信报告。
 
 ---
 
-## 快速开始
+## 核心能力
+
+- **LangGraph Agent**：任务理解 → Skill 选择 → 数据画像 → 规划 → Tool Calling 循环 → 洞察 → 报告，LLM 自主决策。
+- **11 个分析工具**：文件读取 / Python 沙箱 / SQL 只读 / 统计 / 相关性 / 异常检测 / 图表 / RAG / 报告。
+- **Agent Skills**：7 个可复用分析方法（销售 / 财务 / 异常 / 相关 / 数据清洗等）。
+- **RAG**：pgvector 向量知识库检索方法论。
+- **MCP**：标准化（stdio）暴露数据分析能力，与普通工具共存。
+- **持久化**：PostgreSQL 落库 + Redis 会话/缓存，全程优雅降级。
+- **安全**：Python 沙箱、SQL 只读守卫、Agent 防死循环。
+
+## 技术栈
+
+Python 3.11+ · LangChain · LangGraph · Pandas · NumPy · Matplotlib · SQLAlchemy ·
+PostgreSQL + pgvector · Redis · MCP · Docker
+
+## 系统架构
+
+```
+用户输入 → Task Understanding → Skill Selection → Dataset Profiler → Planner
+            → Tool Calling 循环（LLM 选工具 → 执行 → 观察 → 决定下一步）
+            → Insight → Report
+          PostgreSQL（落库） + Redis（会话/缓存） + RAG + MCP + Tools
+```
+
+## 环境要求
+
+- Python 3.11+
+- Docker（用于启动 PostgreSQL + pgvector + Redis）
+- OpenAI 兼容 LLM API Key（DeepSeek / Qwen / Kimi / GLM / OpenAI 等）
+
+---
+
+## 快速开始（从零启动）
 
 ```bash
-# 1. 创建虚拟环境并安装依赖
-python -m venv .venv
-./.venv/Scripts/python.exe -m pip install -e ".[dev]"   # Windows (Git Bash)
-# Linux/macOS: source .venv/bin/activate && pip install -e ".[dev]"
+# 1. 克隆项目
+git clone <your-repo-url> ai-data-analyst-agent
+cd ai-data-analyst-agent
 
-# 2. 配置 LLM（OpenAI 兼容接口：DeepSeek / Qwen / Kimi / GLM / OpenAI 等）
+# 2. 配置环境变量
 cp .env.example .env
 # 编辑 .env，填入 LLM_API_KEY（必要时改 LLM_BASE_URL / LLM_MODEL）
 
-# 3. 生成示例数据（已内置，可跳过；如需重新生成）
-./.venv/Scripts/python.exe scripts/generate_sample_data.py
+# 3. 启动基础设施（PostgreSQL + pgvector + Redis）
+docker compose up -d
 
-# 4. 运行
+# 4. 创建虚拟环境并安装依赖
+python -m venv .venv
+./.venv/Scripts/python.exe -m pip install -e ".[dev]"   # Windows (Git Bash)
+# source .venv/bin/activate && pip install -e ".[dev]"   # Linux/macOS
+
+# 5. 初始化数据库表 + 导入知识库（首次运行一次即可）
+./.venv/Scripts/python.exe -m src.db.init_db
+./.venv/Scripts/python.exe scripts/ingest_knowledge.py
+
+# 6. 运行
 ./.venv/Scripts/python.exe main.py
 ```
 
@@ -38,6 +77,30 @@ cp .env.example .env
 请输入你的分析需求：
 > 分析今年销售额下降的主要原因，找出表现最差的地区和产品，检测异常数据，并生成完整报告。
 ```
+
+## .env 配置
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `LLM_API_KEY` | ✅ | LLM API Key（OpenAI 兼容接口） |
+| `LLM_BASE_URL` | ✅ | 接口地址，如 `https://api.deepseek.com/v1` |
+| `LLM_MODEL` | ✅ | 模型名，如 `deepseek-chat` |
+| `DATABASE_URL` | 可选 | PostgreSQL 连接串（默认已配好） |
+| `REDIS_URL` | 可选 | Redis 连接串（默认已配好） |
+| `MCP_ENABLED` | 可选 | 是否启用 MCP 工具，默认 `false` |
+| `DB_ENABLED` / `REDIS_ENABLED` | 可选 | 持久化开关，默认 `true` |
+| `EMBEDDING_*` | 可选 | 填 `EMBEDDING_API_KEY` 用真实语义向量，留空用本地哈希向量 |
+| `MAX_STEPS` 等 | 可选 | Agent 控制参数，保持默认 |
+
+## Docker 启动
+
+```bash
+docker compose up -d                            # 启动 PostgreSQL(pgvector) + Redis
+docker compose ps                               # 查看状态（postgres healthy / redis running）
+docker exec analyst-redis redis-cli ping        # 应返回 PONG
+```
+
+> 数据卷 `pgdata` 持久化；**不要**执行 `docker compose down -v`（会删除数据）。
 
 ## 示例数据
 
@@ -150,6 +213,7 @@ ai-data-analyst-agent/
   报告只引用实际生成的图表，虚假图表引用被 `sanitize_report()` 自动剔除。
 - **质量检查** `validate_report()`：检查非空、章节、占位符、JSON 残留、虚假图表引用（失败仅告警不中断）。
 
-## 后续路线（未实现 Phase）
+## 后续路线
 
-- Phase 12 测试补全、Phase 13 Docker 完善、Phase 14 README/Demo 完善。
+- 应用容器化（Dockerfile）—— 当前应用在宿主机 venv 运行，仅基础设施（PG/Redis）容器化。
+- README 补充真实运行截图与更完整的 Demo 说明。
