@@ -305,12 +305,6 @@ ai-data-analyst-agent/
   报告只引用实际生成的图表，虚假图表引用被 `sanitize_report()` 自动剔除。
 - **质量检查** `validate_report()`：检查非空、章节、占位符、JSON 残留、虚假图表引用（失败仅告警不中断）。
 
-## 简历项目描述（可直接放入 BOSS 直聘）
-
-> **AI 数据分析智能体（LangGraph + MCP + RAG + PostgreSQL）**
->
-> 基于 LangGraph 构建的本地 AI 数据分析智能体，用户提供数据文件 + 自然语言需求，Agent 自主规划、调用 11 个工具（含 Python 沙箱、SQL 只读、统计、图表、RAG 检索）循环执行真实分析，最终生成结构化可追溯的 Markdown 报告。
-> 技术亮点：Agent 自主决策循环（非固定流程）、可复用 Agent Skills、pgvector 向量知识库 RAG、MCP（stdio）标准化工具、PostgreSQL 六表业务落库 + Redis 会话缓存、Docker 一键启动、Python AST 沙箱 + SQL 只读守卫。121 个测试全绿，真实 DeepSeek 多轮分析端到端跑通。
 
 ## 后续路线
 
