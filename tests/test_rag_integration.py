@@ -1,4 +1,9 @@
-"""RAG 集成测试：FakeChatModel 驱动全图，Agent 自主调用 retrieve_knowledge，结果影响报告。"""
+"""RAG 集成测试（src.rag × src.agent）。
+
+用 FakeChatModel 驱动完整 LangGraph：Agent 先自主调用 retrieve_knowledge 获取方法论，
+再调用 detect_outliers 完成分析，最终把知识库内容反映到工具结果与报告中。
+检索器使用内存实现，避免依赖外部 PostgreSQL。
+"""
 
 from __future__ import annotations
 
@@ -15,17 +20,21 @@ class FakeChatModel:
 
     def __init__(self) -> None:
         self._tools = []
+        # 控制 Agent 节点按次序先后请求两个工具
         self.agent_calls = 0
 
     def bind_tools(self, tools):
+        """模拟 bind_tools 并返回自身。"""
         self._tools = tools
         return self
 
     def invoke(self, messages):
+        """按 system 消息关键词返回各节点的脚本响应。"""
         first = messages[0].content if messages else ""
         if "自主的数据分析智能体" in first:
             return self._agent_response()
         if "规划者" in first:
+            # 计划指定先用 RAG 检索异常检测方法
             return AIMessage(content='[{"step":1,"goal":"检测异常","tool":"retrieve_knowledge","note":"检索异常检测方法"}]')
         if "洞察专家" in first:
             return AIMessage(content="洞察1：结合知识库，采用 z-score（阈值3）检测到异常值。")
@@ -36,6 +45,7 @@ class FakeChatModel:
         return AIMessage(content="ok")
 
     def _agent_response(self) -> AIMessage:
+        """第一次请求知识库检索，第二次请求异常检测，第三次给出结论结束循环。"""
         self.agent_calls += 1
         if self.agent_calls == 1:
             return AIMessage(
@@ -65,6 +75,7 @@ class FakeChatModel:
 
 
 def _patch_all_llm(monkeypatch, fake: FakeChatModel) -> None:
+    """把五个节点与技能选择器的 get_llm 全部替换为假模型。"""
     monkeypatch.setattr("src.agent.nodes.task_understanding.get_llm", lambda: fake)
     monkeypatch.setattr("src.agent.nodes.planner.get_llm", lambda: fake)
     monkeypatch.setattr("src.agent.nodes.tool_calling.get_llm", lambda: fake)
@@ -74,11 +85,13 @@ def _patch_all_llm(monkeypatch, fake: FakeChatModel) -> None:
 
 
 def test_rag_tool_used_in_agent_loop(monkeypatch) -> None:
+    """全图运行中 Agent 应自主调用 retrieve_knowledge，结果真实返回并最终生成报告。"""
     # 用内存检索器替代 get_retriever，避免依赖外部 PG（快速、确定性）
     from src.rag.embeddings import HashingEmbedder
     from src.rag.retriever import KnowledgeRetriever
     from src.rag.vector_store import InMemoryVectorStore
 
+    # 构造哈希嵌入 + 内存向量库的离线检索器（检索时会自动导入知识库）
     embedder = HashingEmbedder(dim=128)
     retriever = KnowledgeRetriever(embedder, InMemoryVectorStore(embedder))
     monkeypatch.setattr("src.tools.rag_tool.get_retriever", lambda: retriever)

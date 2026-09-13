@@ -1,0 +1,92 @@
+# CI/CD 流水线：代码推送 / PR 时自动执行静态检查、测试与镜像构建
+# 三个任务并行：test（lint+pytest）、docker（构建/推送镜像）；二者都绿才算通过
+name: CI
+
+# 触发时机：推送到 main、向 main 发起 PR；以及手动从 Actions 页面触发
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的新推送自动取消旧的流水线运行，省 CI 额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===== 任务一：静态检查 + 单元测试 =====
+  test:
+    name: Lint & Test (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # 按 pyproject.toml 内容缓存 pip 下载，依赖不变时加速构建
+          cache: pip
+          # 入参名为 cache-dependency-path（setup-python 无 dependency-files 这个入参）
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装项目（含 dev 测试/lint 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff 静态检查（pyflakes 规则：未用导入、变量遮蔽等真实问题）
+        run: ruff check src scripts main.py tests
+
+      - name: 全量语法编译检查
+        run: python -m compileall -q src scripts main.py tests
+
+      - name: 运行 pytest（需要真实 PG/Redis 的集成测试在环境缺失时自动 skip）
+        run: pytest --cov=src --cov-report=term-missing
+
+  # ===== 任务二：构建 Docker 镜像（验证可构建 + 中文字体层）=====
+  # main 分支推送时额外把镜像推送到 GitHub Container Registry（ghcr.io）
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    # 推送镜像需要 packages 写权限；PR 来自 fork 时 GITHUB_TOKEN 自动只读，不会泄露
+    permissions:
+      packages: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（仅 main 分支推送时推送镜像，其余情况只构建验证）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签（owner/repo 全小写 + 版本/简短 SHA）
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: 构建并（在 main 上）推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 非 main 场景 push=false，仅验证 Dockerfile 能否成功构建
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 构建结果缓存到 GitHub 的容器缓存，加快下次构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

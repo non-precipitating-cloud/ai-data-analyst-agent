@@ -1,48 +1,56 @@
+# Docker Compose 编排文件：用 `docker compose up -d` 一键启动下面三个服务
 services:
+
+  # ===== PostgreSQL 数据库（带 pgvector 向量扩展，供业务持久化 + RAG 向量检索）=====
   postgres:
-    image: pgvector/pgvector:pg16
-    container_name: analyst-postgres
+    image: pgvector/pgvector:pg16        # 基于 PostgreSQL 16、预装 pgvector 扩展的官方镜像
+    container_name: analyst-postgres     # 固定容器名，方便用 docker 命令直接操作
     environment:
-      POSTGRES_USER: analyst
-      POSTGRES_PASSWORD: analyst
-      POSTGRES_DB: analyst
+      POSTGRES_USER: analyst             # 首次启动时自动创建的数据库用户名
+      POSTGRES_PASSWORD: analyst         # 对应密码（仅本地开发，生产环境需修改）
+      POSTGRES_DB: analyst               # 首次启动时自动创建的数据库名
     ports:
-      - "5432:5432"
+      - "5432:5432"                      # 把容器 5432 端口映射到宿主机，本机工具可直连
     volumes:
+      # 命名卷挂载：数据库数据持久化，容器删除后数据不丢
       - pgdata:/var/lib/postgresql/data
+      # 首次初始化脚本：只读挂载，容器首启时自动执行以启用 vector 扩展
       - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U analyst -d analyst"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      test: ["CMD-SHELL", "pg_isready -U analyst -d analyst"]  # 用 pg_isready 检查数据库是否就绪
+      interval: 5s                       # 每 5 秒检查一次
+      timeout: 5s                        # 单次检查超时 5 秒
+      retries: 10                        # 连续失败 10 次才判定为不健康
 
+  # ===== Redis 缓存/会话存储 =====
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine                # Redis 7 轻量版镜像（alpine 体积小）
     container_name: analyst-redis
     ports:
-      - "6379:6379"
+      - "6379:6379"                      # 映射到宿主机 6379，本机可直连调试
 
+  # ===== AI 分析师 Agent 应用本身 =====
   agent:
-    build: .
+    build: .                             # 用当前目录的 Dockerfile 构建镜像
     container_name: analyst-agent
     # 容器内通过 Compose 服务名访问 PostgreSQL / Redis（不能用 localhost）
     environment:
-      DATABASE_URL: postgresql+psycopg://analyst:analyst@postgres:5432/analyst
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+psycopg://analyst:analyst@postgres:5432/analyst  # 主机名 postgres 指向上面的数据库服务
+      REDIS_URL: redis://redis:6379/0    # 主机名 redis 指向上面的缓存服务
     env_file:
-      - .env
+      - .env                             # 从 .env 文件注入其余配置（API Key、模型名等）
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy       # 等数据库健康检查通过后再启动 Agent
       redis:
-        condition: service_started
+        condition: service_started       # Redis 启动后即可（无健康检查）
     volumes:
-      - reports_data:/app/reports
-    stdin_open: true
-    tty: true
-    restart: "no"
+      - reports_data:/app/reports        # 生成的分析报告写到命名卷，容器重建后报告仍保留
+    stdin_open: true                     # 保持标准输入打开（配合交互式运行）
+    tty: true                            # 分配伪终端，支持前台交互
+    restart: "no"                        # 不自动重启（按需手动运行）
 
+# ===== 命名卷声明（Docker 管理的持久化存储）=====
 volumes:
-  pgdata:
-  reports_data:
+  pgdata:                                # PostgreSQL 数据卷
+  reports_data:                          # Agent 报告输出卷

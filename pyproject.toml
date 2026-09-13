@@ -1,42 +1,84 @@
+# ===== 构建系统配置（PEP 517）：声明用什么工具把项目打包成可安装的包 =====
 [build-system]
+# 构建阶段需要的依赖：setuptools 负责打包，wheel 用于生成 .whl 分发包
 requires = ["setuptools>=68", "wheel"]
+# 构建后端入口：pip 构建时通过它调用 setuptools 完成实际构建
 build-backend = "setuptools.build_meta"
 
+# ===== 项目元数据与运行时依赖（PEP 621 标准的 [project] 表）=====
 [project]
+# 分发包名（pip install 时使用的名字）
 name = "ai-data-analyst-agent"
+# 语义化版本号
 version = "0.1.0"
+# 一句话项目描述
 description = "AI Data Analyst Agent - a LangGraph-based agent that analyzes CSV/Excel/JSON data from natural language requests."
+# README 文件，打包时一并包含
 readme = "README.md"
+# 运行所需的最低 Python 版本（代码使用了 3.11+ 的语法特性）
 requires-python = ">=3.11"
+# 开源许可证类型
 license = { text = "MIT" }
+# 运行时依赖清单：执行 pip install . 时会自动安装下列包
 dependencies = [
+    # --- Agent / LLM 框架栈：LangChain 生态 + LangGraph 状态图 ---
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
     "langgraph>=0.2.0",
+    # --- 配置与数据校验：把环境变量/.env 映射为类型安全的配置对象 ---
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
     "python-dotenv>=1.0.0",
+    # --- 数据分析与可视化 ---
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "matplotlib>=3.8.0",
+    # openpyxl 是 pandas 读写 .xlsx Excel 文件所需的引擎
     "openpyxl>=3.1.0",
+    # --- 持久化与缓存：SQLAlchemy ORM、PostgreSQL 驱动（psycopg3）、Redis 客户端 ---
     "sqlalchemy>=2.0.0",
     "psycopg[binary]>=3.1.0",
     "redis>=5.0.0",
+    # --- MCP（Model Context Protocol）：接入外部工具服务器 ---
     "mcp>=2.0.0",
+    # Windows 上 mcp 的 stdio 传输依赖 pywin32（pywintypes/pythoncom）；
+    # 环境标记保证该依赖只在 Windows 安装，Linux/macOS 不受影响
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
+# ===== 可选依赖组：开发/测试时额外安装，如 pip install -e ".[dev]" =====
 [project.optional-dependencies]
 dev = [
+    # 单元测试框架
     "pytest>=8.0.0",
+    # 测试覆盖率插件（pytest --cov）
     "pytest-cov>=5.0.0",
+    # 极速静态检查（本地开发与 CI 工作流共用同一规则）
+    "ruff>=0.6.0",
 ]
 
+# ===== setuptools 包发现规则：决定哪些目录被当作 Python 包打包 =====
 [tool.setuptools.packages.find]
+# 从当前目录（项目根）开始查找
 where = ["."]
+# 只打包 src 及其子包，排除 tests 等非运行时代码
 include = ["src*"]
 
+# ===== pytest 测试框架配置 =====
 [tool.pytest.ini_options]
+# 把项目根加入 Python 导入路径，测试文件里可直接 import src.*
 pythonpath = ["."]
+# 测试用例的搜索目录
 testpaths = ["tests"]
+# 默认命令行参数：-q 为简洁输出模式，只打印概要结果
 addopts = "-q"
+
+# ===== ruff 静态检查配置（本地 ruff check 与 GitHub Actions CI 共用）=====
+[tool.ruff]
+# 单行长度建议值（当前仅启用 F 类规则，此项为后续启用风格规则预留）
+line-length = 100
+
+[tool.ruff.lint]
+# F = pyflakes 规则族：未使用的导入/变量、名字遮蔽、重复定义等「真实问题」
+# 暂不启用 E/W 风格类规则，避免对中文注释/长提示词的教学型项目过度约束
+select = ["F"]

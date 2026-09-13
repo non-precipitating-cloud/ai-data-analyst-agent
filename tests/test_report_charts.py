@@ -1,4 +1,11 @@
-"""报告图表清单测试：验证报告只会引用实际生成的图表。"""
+"""报告图表清单测试：保证报告只会引用实际生成的图表。
+
+覆盖：
+- 从工具输出文本中提取图表路径（_extract_chart_path）；
+- tools_node 执行 generate_chart 后把真实存在的文件记入 generated_charts；
+- report_node 组装的 prompt 图表清单严格限定为真实文件，不泄漏虚构路径；
+- _format_charts 的空态提示。
+"""
 
 from __future__ import annotations
 
@@ -20,17 +27,20 @@ class _CapturingLLM:
         self.prompt = ""
 
     def invoke(self, messages) -> AIMessage:
+        # 保存最后一条（即拼装好的报告 prompt）
         self.prompt = messages[-1].content
         return AIMessage(content="# 报告\n\n## 图表说明\n见清单")
 
 
 def test_extract_chart_path() -> None:
+    """应从工具输出文本中提取 Windows 风格 .png 路径；无路径时返回 None。"""
     assert _extract_chart_path("图表已生成: C:/a/b.png") == "C:/a/b.png"
     assert _extract_chart_path("其他输出") is None
 
 
 def test_tools_node_records_generated_charts() -> None:
     """tools_node 执行 generate_chart 后，会把真实存在的文件路径写入 generated_charts。"""
+    # 构造一条仅含 generate_chart 调用的 AI 消息
     msg = AIMessage(
         content="",
         tool_calls=[
@@ -44,6 +54,7 @@ def test_tools_node_records_generated_charts() -> None:
     )
     update = tools_node({"messages": [msg]})
 
+    # 恰好记录一张图表
     assert len(update["generated_charts"]) == 1
     chart_path = Path(update["generated_charts"][0])
     assert chart_path.exists()  # 路径必须真实存在
@@ -53,6 +64,7 @@ def test_tools_node_records_generated_charts() -> None:
 def test_report_prompt_only_lists_real_charts(monkeypatch) -> None:
     """报告 prompt 的图表清单只能包含 generated_charts 中的真实文件，不出现不存在的文件。"""
     charts_dir = get_settings().charts_dir
+    # 准备两个真实存在（空文件）的图表占位
     real = [charts_dir / "real_a.png", charts_dir / "real_b.png"]
     for p in real:
         p.write_bytes(b"")
@@ -60,6 +72,7 @@ def test_report_prompt_only_lists_real_charts(monkeypatch) -> None:
     fake = _CapturingLLM()
     monkeypatch.setattr("src.agent.nodes.report.get_llm", lambda: fake)
 
+    # 状态里只登记这两张真实图表
     state = {
         "user_request": "分析销售额",
         "dataset_metadata": {"num_rows": 10, "num_columns": 3, "columns": ["a", "b", "c"]},
@@ -70,7 +83,7 @@ def test_report_prompt_only_lists_real_charts(monkeypatch) -> None:
     }
     result = report_node(state)
 
-    # 清单里只出现这两个真实图表，且不包含任何其他 .png
+    # 用正则从 prompt 中抽出所有 .png 文件名，应恰好等于两张真实图表
     pngs = set(re.findall(r"[\w\-]+\.png", fake.prompt))
     assert pngs == {"real_a.png", "real_b.png"}
 
@@ -84,4 +97,5 @@ def test_report_prompt_only_lists_real_charts(monkeypatch) -> None:
 
 
 def test_format_charts_empty() -> None:
+    """空图表清单格式化后应包含“未生成”提示。"""
     assert "未生成" in _format_charts([])

@@ -1,24 +1,43 @@
-"""规划节点：基于任务理解与数据画像生成分析计划。"""
+"""规划节点模块：在正式分析前让 LLM 产出结构化的分析计划。
+
+在 Agent 架构中位于 profiler（数据画像）之后、agent 工具调用循环之前：
+节点拿到任务理解、数据集字段和已选 Skill 方法论后，要求 LLM 输出一个
+JSON 数组形式的分步计划（每步含目标、建议工具、做法），为后续 Agent
+的工具调用提供「行动路线图」。
+"""
 
 from __future__ import annotations
 
 import json
 
+# LangChain 消息类型
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+# 规划节点专用系统提示词（规定输出 JSON 数组的字段结构）
 from src.agent.prompts import PLANNER_SYSTEM
+# 图共享状态类型
 from src.agent.state import AgentState
+# parse_json 容错解析 LLM 输出；truncate 限制 Skill 上下文长度
 from src.agent.utils import parse_json, truncate
+# LLM 工厂
 from src.llm import get_llm
 
 
 def planner_node(state: AgentState) -> dict:
-    """生成分析计划（JSON 数组）。"""
+    """规划节点：调用 LLM 生成分析计划并解析为步骤列表。
+
+    :param state: 图当前共享状态，需包含 user_request、understanding、
+                  skills_context 及 dataset_metadata（字段/数值列信息）
+    :return: 状态增量：analysis_plan 覆盖为解析出的步骤列表，
+             observations 与 messages 各累加一份易读的计划文本
+    """
     llm = get_llm()
+    # 从数据画像中取出全部字段与数值字段，帮助 LLM 选出可行的工具与列
     meta = state.get("dataset_metadata", {})
     columns = meta.get("columns", [])
     numeric = meta.get("numeric_columns", [])
 
+    # 组装人类消息：需求 + 任务理解 + Skill 方法论（截断）+ 字段信息
     prompt = HumanMessage(
         content=(
             f"用户需求：{state['user_request']}\n"
@@ -28,14 +47,19 @@ def planner_node(state: AgentState) -> dict:
             f"数值字段：{numeric}"
         )
     )
+    # 发起 LLM 调用，期望返回纯 JSON 数组文本
     resp = llm.invoke([SystemMessage(content=PLANNER_SYSTEM), prompt])
+    # 容错解析：LLM 若带围栏/废话也能抽出 JSON；解析失败统一降级为空计划
     plan = parse_json(resp.content)
     if not isinstance(plan, list):
         plan = []
 
+    # 把计划重新序列化为缩进 JSON 文本，便于写入观察记录与对话历史
     plan_text = json.dumps(plan, ensure_ascii=False, indent=2)
     return {
+        # 普通字段（覆盖语义）：保存最终步骤列表供后续节点参考
         "analysis_plan": plan,
+        # 累加字段：在过程观察与对话历史中各留一份可读计划
         "observations": [f"[分析计划]\n{plan_text}"],
         "messages": [AIMessage(content=f"[分析计划]\n{plan_text}")],
     }

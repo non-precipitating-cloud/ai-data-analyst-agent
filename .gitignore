@@ -1,45 +1,80 @@
 # Python
+
+# Python 运行时缓存、打包产物与虚拟环境
+# import 时自动生成的字节码缓存目录
 __pycache__/
+# .pyc/.pyo/.pyd 等编译文件
 *.py[cod]
+# 包安装时生成的元数据目录
 *.egg-info/
+# egg 格式的安装包
 *.egg
+# setuptools 下载依赖的缓存目录
 .eggs/
+# 打包构建中间产物
 build/
+# 打包发布的最终产物
 dist/
+# 虚拟环境（各人本地重建，不提交），以下三种为常见目录命名
 .venv/
 venv/
 env/
 
 # Env / secrets
+# 环境变量与密钥：防止 API Key 等泄露到仓库（只提交 .env.example 模板）
 .env
 *.env.local
 
 # Test / coverage
+# 测试缓存与覆盖率报告
+# pytest 运行缓存
 .pytest_cache/
+# coverage.py 生成的覆盖率数据
 .coverage
+# 覆盖率 HTML 报告目录
 htmlcov/
+# 其他带后缀的覆盖率数据文件
 .coverage.*
 
 # Logs
+# 运行日志
+# logs 目录下所有 .log 文件
 logs/*.log
+# 整个 logs 目录（兜底，连子目录一起忽略）
 logs/
 
 # Generated artifacts (reports, charts, workspace)
+# Agent 运行时生成的分析结果，属于产物而非源码
+# 生成的 Markdown 分析报告
 reports/*.md
+# 生成的图表文件
 reports/charts/*
+# 运行时工作区临时文件
 workspace/
 
 # IDE
+# 各人编辑器/IDE 的本地配置
+# PyCharm / JetBrains 系列配置
 .idea/
+# VS Code 配置
 .vscode/
+# vim 异常退出留下的交换文件
 *.swp
 
 # OS
+# 操作系统自动生成的杂项文件
+# macOS 文件夹缩略图/排序信息
 .DS_Store
+# Windows 缩略图缓存
 Thumbs.db
 
 # Data (keep sample datasets tracked; ignore user uploads)
+# 数据文件：忽略用户上传，但用 ! 取反保留随仓库分发的样例数据
+# 忽略 datasets 下所有 CSV（即用户上传的数据）
 datasets/*.csv
+# 例外：保留样例数据 sales.csv
 !datasets/sales.csv
+# 例外：保留样例数据 ecommerce.csv
 !datasets/ecommerce.csv
+# 例外：保留样例数据 financial.csv
 !datasets/financial.csv

@@ -3,6 +3,10 @@
 真实 MCP Server：复用 src/tools 与 src/rag 的底层实现（安全沙箱/只读 SQL 等），
 通过 stdio 传输协议对外提供工具。
 
+通信模型：本进程不主动发起任何网络请求，只从 stdin 读取 Client 发来的
+JSON-RPC 消息（initialize / tools/list / tools/call），把工具返回值序列化为
+JSON 后写回 stdout；日志等噪声只能走 stderr，避免污染协议通道。
+
 启动方式：
     python -m src.mcp.server
 """
@@ -19,7 +23,6 @@ from src.tools.file_tools import _inspect_schema, _read_dataset
 from src.tools.python_tool import run_python
 from src.tools.sql_tool import run_sql
 from src.tools.stats_tools import (
-    calculate_correlation,
     detect_outliers as detect_outliers_tool,
 )
 
@@ -31,6 +34,15 @@ server = MCPServer(
 
 
 def _json(obj) -> str:
+    """把工具返回对象序列化为 JSON 字符串（统一出口）。
+
+    Args:
+        obj: 任意可 JSON 化对象（dict/list/DataFrame 转换结果等）。
+
+    Returns:
+        UTF-8 友好（不转义中文）的 JSON 字符串；default=str 兜底
+        datetime、numpy 标量等无法直接序列化的类型。
+    """
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
@@ -40,10 +52,14 @@ def read_dataset(path: str) -> str:
 
     Args:
         path: 数据文件路径（支持 .csv / .xlsx / .json）。
+
+    Returns:
+        数据概览的 JSON 字符串；失败时返回中文错误说明文本（不向客户端抛异常）。
     """
     try:
         return _json(_read_dataset(path))
     except Exception as e:  # noqa: BLE001
+        # 工具级错误收敛为错误文本，由客户端依据内容判断，避免子进程崩溃
         return f"读取失败：{type(e).__name__}: {e}"
 
 
@@ -53,6 +69,9 @@ def get_schema(path: str) -> str:
 
     Args:
         path: 数据文件路径。
+
+    Returns:
+        字段名/类型信息的 JSON 字符串；失败时返回中文错误说明文本。
     """
     try:
         return _json(_inspect_schema(path))
@@ -66,6 +85,10 @@ def execute_sql(sql: str) -> str:
 
     Args:
         sql: 只读 SQL 语句（SELECT/WITH/EXPLAIN）。
+
+    Returns:
+        JSON 字符串，含行数、列名和前 50 行数据（限制消息体积）；
+        底层 run_sql 会拦截写操作，非法/失败语句返回中文错误说明文本。
     """
     try:
         df = run_sql(sql)
@@ -73,6 +96,7 @@ def execute_sql(sql: str) -> str:
             {
                 "num_rows": int(len(df)),
                 "columns": list(df.columns),
+                # 只回传前 50 行，避免大结果集撑爆 stdio 消息与 LLM 上下文
                 "data": df.head(50).to_dict(orient="records"),
             }
         )
@@ -87,8 +111,12 @@ def run_analysis(code: str, dataset_path: str) -> str:
     Args:
         code: 分析代码，数据已加载为变量 df，需用 print() 输出结果。
         dataset_path: 数据文件路径。
+
+    Returns:
+        沙箱执行后的标准输出文本；执行异常时返回中文错误说明文本。
     """
     try:
+        # run_python 在受限沙箱中运行，隔离文件系统/网络风险
         return run_python(code, dataset_path)
     except Exception as e:  # noqa: BLE001
         return f"执行出错：{type(e).__name__}: {e}"
@@ -102,7 +130,11 @@ def detect_outliers(path: str, column: str = "", method: str = "zscore") -> str:
         path: 数据文件路径。
         column: 数值列名，留空检测所有数值列。
         method: zscore 或 iqr。
+
+    Returns:
+        异常检测结果文本（复用本地 LangChain 工具的 invoke 入口）。
     """
+    # 直接复用 stats_tools 中的 LangChain 工具，以字典形式传参调用
     return detect_outliers_tool.invoke(
         {"path": path, "column": column, "method": method}
     )
@@ -118,6 +150,9 @@ def generate_chart(path: str, chart_type: str, x: str, y: str = "", title: str =
         x: 横轴字段。
         y: 数值字段（hist 可省略）。
         title: 标题（可选）。
+
+    Returns:
+        成功时返回 PNG 文件路径提示；失败时返回中文错误说明文本。
     """
     try:
         out = generate_chart_file(path, chart_type, x, y, title)
@@ -133,13 +168,19 @@ def retrieve_knowledge(query: str, top_k: int = 5) -> str:
     Args:
         query: 检索问题。
         top_k: 返回条数。
+
+    Returns:
+        多条命中知识拼接的文本（含分类、相似度、正文摘要）；
+        检索异常返回错误文本，无命中时返回空结果提示。
     """
     try:
+        # 走 RAG 链路：query embedding → pgvector/内存库相似度检索 → Top-K
         results = get_retriever().retrieve(query, top_k)
     except Exception as e:  # noqa: BLE001
         return f"知识库检索失败：{type(e).__name__}: {e}"
     if not results:
         return "知识库为空或未检索到相关内容。"
+    # 每条只取前 240 字摘要，并标注分类与相似度分数，控制返回长度
     return "\n\n".join(
         f"[{r['metadata'].get('category', '?')}] (相似度 {r['score']}) {r['text'][:240]}"
         for r in results
@@ -147,6 +188,8 @@ def retrieve_knowledge(query: str, top_k: int = 5) -> str:
 
 
 def main() -> None:
+    """以 stdio 传输方式启动 MCP Server（阻塞运行，处理来自 Client 的 JSON-RPC）。"""
+    # 消息经 stdin/stdout 收发；server 内部循环直到管道关闭
     server.run(transport="stdio")
 
 
