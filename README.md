@@ -1,10 +1,13 @@
 # AI Data Analyst Agent
 
+[![CI](https://github.com/non-precipitating-cloud/ai-data-analyst-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/non-precipitating-cloud/ai-data-analyst-agent/actions/workflows/ci.yml)
+
 一个基于 **LangGraph** 的本地 AI 数据分析智能体：用户提供 CSV / Excel / JSON 数据文件 + 一句自然语言需求，
 Agent 自主规划、自主调用工具执行真实分析、根据中间结果循环决策，最终生成结构化、可追溯的 Markdown 分析报告。
 
 > 当前状态：**Phase 1–13.3 已完成**。完整实现「LangGraph Agent + Tool Calling + Skills + RAG + MCP +
-> PostgreSQL + Redis + Docker」，**121 个测试全绿**，真实 DeepSeek 多轮自主分析跑通并落库。
+> PostgreSQL + Redis + Docker」，**128 个测试（127 通过 + 1 个依赖 PostgreSQL 的集成用例自动跳过）**，
+> 真实 DeepSeek 多轮自主分析跑通并落库；CI（ruff 静态检查 + pytest + Docker 构建校验）已接入 GitHub Actions。
 
 ---
 
@@ -16,9 +19,10 @@ Agent 自主规划、自主调用工具执行真实分析、根据中间结果�
 - 🔍 **RAG**：PostgreSQL + pgvector 向量知识库，检索数据分析方法论辅助决策，不可用时自动回退内存实现。
 - 🔌 **MCP（Model Context Protocol）**：stdio 标准化暴露 7 个分析能力，与本地工具动态共存（`mcp__` 前缀区分）。
 - 🗄️ **PostgreSQL + Redis**：业务数据落库（6 表）+ 会话/缓存，全程优雅降级（不可用仅告警不中断）。
-- 🐳 **Docker 容器化**：`docker compose up -d` 一键启动 agent + postgres + redis。
-- 🛡️ **安全执行**：Python AST 沙箱 + SQL 只读守卫 + Agent 防死循环。
-- ✅ **121 个测试全部通过**，真实 Demo 端到端跑通。
+- 🐳 **Docker 容器化**：`docker compose up -d` 一键启动 agent + postgres + redis，镜像内置思源黑体。
+- 🛡️ **安全执行**：Python AST 沙箱 + SQL 只读四层守卫 + Agent 防死循环。
+- 🈶 **中文图表开箱可用**：按平台自动探测已安装中文字体（Noto CJK / 文泉驿 / 雅黑 / 苹方等），不再出现方框。
+- ✅ **128 个测试（127 通过 + 1 跳过）**，真实 Demo 端到端跑通，CI 全绿。
 
 ---
 
@@ -139,12 +143,18 @@ python -m venv .venv
 | `LLM_API_KEY` | ✅ | LLM API Key（OpenAI 兼容接口） |
 | `LLM_BASE_URL` | ✅ | 接口地址，如 `https://api.deepseek.com/v1` |
 | `LLM_MODEL` | ✅ | 模型名，如 `deepseek-chat` |
+| `LLM_TIMEOUT_SECONDS` | 可选 | LLM 单次 HTTP 调用超时，默认 `60` |
+| `LLM_MAX_RETRIES` | 可选 | 429/5xx/网络抖动的自动重试次数（指数退避），默认 `3` |
 | `DATABASE_URL` | 可选 | PostgreSQL 连接串（默认已配好） |
 | `REDIS_URL` | 可选 | Redis 连接串（默认已配好） |
 | `MCP_ENABLED` | 可选 | 是否启用 MCP 工具，默认 `false` |
 | `DB_ENABLED` / `REDIS_ENABLED` | 可选 | 持久化开关，默认 `true` |
 | `EMBEDDING_*` | 可选 | 填 `EMBEDDING_API_KEY` 用真实语义向量，留空用本地哈希向量 |
+| `EXTRA_DATA_DIRS` | 可选 | 额外允许读取数据文件的目录，JSON 数组，如 `["/data"]`；默认仅允许 `datasets/` |
 | `MAX_STEPS` 等 | 可选 | Agent 控制参数，保持默认 |
+
+> 变量名 = `settings.py` 中字段名的大写形式（`extra_data_dirs` → `EXTRA_DATA_DIRS`）。
+> 写错名字不会报错，只会被静默忽略。
 
 ## Docker 启动（全栈）
 
@@ -169,7 +179,8 @@ docker compose exec agent python main.py
 > - 报告写入 `reports_data` 数据卷（持久化），可用 `docker cp analyst-agent:/app/reports/xxx.md .` 取回。
 > - 宿主机 venv 方式（上方「快速开始」）仍可用，两者互不影响。
 > - 数据卷持久化；**不要**执行 `docker compose down -v`（会删除数据）。
-> - 已知限制：`python:3.11-slim` 镜像未内置中文字体，容器内图表中文标签会显示为方框（非阻塞，后续优化）。
+> - 中文图表：`python:3.11-slim` 本身不含 CJK 字体，Dockerfile 已额外安装 `fonts-noto-cjk` + `fontconfig`，
+>   图表工具会自动探测到 `Noto Sans CJK SC` 并用于标题/轴标签，容器内不再出现方框。
 
 ## 示例数据
 
@@ -200,11 +211,15 @@ docker compose exec agent python main.py
 
 > 报告样例：`reports/analysis_report_*.md`；图表：`reports/charts/*.png`
 
-## 运行测试
+## 运行测试与静态检查
 
 ```bash
-./.venv/Scripts/python.exe -m pytest
+./.venv/Scripts/python.exe -m pytest                          # 128 项：127 通过 + 1 跳过（需 PostgreSQL）
+./.venv/Scripts/python.exe -m pytest --cov=src                # 带覆盖率
+./.venv/Scripts/python.exe -m ruff check src scripts main.py tests   # 静态检查
 ```
+
+以上三项与 CI（`.github/workflows/ci.yml`）执行的命令一致，本地跑绿即大概率 CI 通过。
 
 ## 项目结构
 
@@ -217,6 +232,7 @@ ai-data-analyst-agent/
 ├── docker-compose.yml       # agent + PostgreSQL(pgvector) + Redis
 ├── docker/init.sql
 ├── .env.example
+├── .github/workflows/ci.yml # CI：ruff + pytest + Docker 构建校验
 ├── scripts/generate_sample_data.py
 ├── scripts/ingest_knowledge.py   # 知识库导入
 ├── datasets/                # 示例数据
@@ -239,10 +255,17 @@ ai-data-analyst-agent/
 
 ## 已实现的安全限制
 
-- **Python 沙箱**：子进程运行于 workspace、AST 模块白名单、禁用 `eval/exec/open/os.system` 等、
-  禁用双下划线属性（阻断逃逸）、超时 + 输出截断。
-- **SQL 只读**：仅允许 `SELECT / WITH / EXPLAIN`，静态拦截 `DROP/DELETE/UPDATE/INSERT/ALTER` 等，
-  拒绝多语句。
+- **Python 沙箱**：子进程运行于 workspace、AST 模块白名单、禁用 `eval/exec/compile/open/__import__` 等
+  内置函数与危险调用属性、禁用双下划线属性访问（如 `__globals__`/`__subclasses__`，阻断逃逸）、
+  超时 + 输出截断。
+- **SQL 只读（四层纵深防御）**：
+  1. 静态校验：仅允许 `SELECT / WITH / EXPLAIN` 开头，拦截 `DROP/DELETE/UPDATE/INSERT/ALTER` 等，拒绝多语句；
+  2. 会话级只读：连接强制 `default_transaction_read_only=on`，绕过关键字过滤也写不进去；
+  3. 语句超时：`statement_timeout=10s`，慢查询由数据库主动取消，防拖垮整库；
+  4. 行数上限：无 `LIMIT` 的查询自动外包 `LIMIT 1000`，防整表读入内存 OOM。
+- **数据文件路径校验**：数据路径统一经 `resolve_dataset_path()` 规范化为绝对路径并做目录边界校验，
+  只允许 `datasets/`（及 `EXTRA_DATA_DIRS` 声明的目录）内文件，阻断 `../../.env`、`/etc/passwd`
+  一类路径穿越读取。
 - **Agent 防死循环**：`max_steps` 上限 + 工具失败不中断 + 错误回传 LLM 自纠。
 
 ## RAG（知识库检索）
@@ -308,6 +331,15 @@ ai-data-analyst-agent/
 
 ## 后续路线
 
-- 图表中文字体（容器 `python:3.11-slim` 未内置中文字体，图表中文标签显示方框）。
-- README 补充真实运行截图。
-- CI/CD（可选）。
+**已完成**
+
+- ✅ **图表中文字体**：`python:3.11-slim` 基础镜像不含任何 CJK 字体，已在 Dockerfile 安装
+  `fonts-noto-cjk` + `fontconfig`；图表工具改为按平台探测系统实际安装的字体（Noto CJK /
+  文泉驿 / 微软雅黑 / 苹方等回退链），不再写死字体名。本机（Windows）实测中文标题与轴标签
+  生成时 **0 条缺字告警**。
+- ✅ **CI/CD**：`.github/workflows/ci.yml` —— ruff 静态检查 + 全量语法编译 + pytest（含覆盖率）
+  + Docker 镜像构建校验；main 分支推送时镜像发布到 `ghcr.io`。
+
+**待办**
+
+- README 补充真实运行截图（Agent 执行过程 + 生成的图表）。
