@@ -11,6 +11,8 @@ from __future__ import annotations
 # LangChain 消息类型：分别承载系统指令、拼装的上下文与 AI 返回内容
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+# LLM 调用的容错与用量记录
+from src.agent.observability import AgentLLMError, invoke_llm
 # 洞察节点专用系统提示词
 from src.agent.prompts import INSIGHT_SYSTEM
 # 图共享状态类型
@@ -19,6 +21,32 @@ from src.agent.state import AgentState
 from src.agent.utils import truncate
 # LLM 工厂：按全局配置返回聊天大模型实例
 from src.llm import get_llm
+
+
+def _fallback_insights(state: AgentState, reason: str) -> str:
+    """LLM 不可用时的确定性兜底洞察。
+
+    刻意**不做任何归纳或推断**——只如实列出已成功执行的分析动作与其状态，
+    并明确说明本次没有产出经过模型提炼的洞察。这样报告的「核心发现」章节
+    会显示为「未生成」，而不是把原始数据包装成看似权威的结论。
+
+    :param state: 图当前共享状态
+    :param reason: 降级原因描述
+    :return: 兜底洞察文本
+    """
+    tools = [tc.get("name", "?") for tc in (state.get("tool_calls") or [])]
+    ok = [
+        tr.get("name", "?")
+        for tr in (state.get("tool_results") or [])
+        if tr.get("status") == "success"
+    ]
+    return (
+        f"⚠️ 未能生成 AI 提炼的洞察（{reason}）。\n\n"
+        f"- 本次共请求工具调用 {len(tools)} 次，其中成功 {len(ok)} 次。\n"
+        f"- 成功执行的工具：{ok or '（无）'}\n"
+        "- 因此本次报告不包含经过模型归纳的核心发现，"
+        "请直接参考「工具结果」章节的原始数据。"
+    )
 
 
 def insight_node(state: AgentState) -> dict:
@@ -61,13 +89,30 @@ def insight_node(state: AgentState) -> dict:
         if hit_step_limit
         else ""
     )
-    resp = llm.invoke([SystemMessage(content=INSIGHT_SYSTEM + step_warning), prompt])
-    insights = resp.content
+    try:
+        resp, record = invoke_llm(
+            [SystemMessage(content=INSIGHT_SYSTEM + step_warning), prompt],
+            llm=llm,
+            node="insight",
+        )
+        insights = resp.content
+        extra: dict = {"llm_calls": [record]}
+    except AgentLLMError as e:
+        # LLM 不可用：走确定性兜底，明确标注「未生成洞察」而不是留空
+        insights = _fallback_insights(state, str(e))
+        extra = {
+            "llm_calls": [{"node": "insight", "success": False, "error": str(e)}],
+            "errors": [f"洞察 LLM 调用失败：{e}"],
+            "degraded": ["洞察阶段 LLM 不可用，未产出模型提炼的核心发现。"],
+        }
 
     # 双保险：即使模型未按提醒开头标注，这里也程序化补一条醒目前缀
     if hit_step_limit and "步数" not in insights[:30]:
         insights = (
             "⚠️ 分析受最大步数限制可能不完整（部分计划步骤未执行）。\n\n" + insights
+        )
+        extra.setdefault("degraded", []).append(
+            "分析触达最大步数上限，部分计划步骤未执行。"
         )
 
     return {
@@ -75,4 +120,5 @@ def insight_node(state: AgentState) -> dict:
         "insights": [insights],
         # 同步写入对话历史，保持消息链完整
         "messages": [AIMessage(content=f"[洞察]\n{insights}")],
+        **extra,
     }

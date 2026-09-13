@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from functools import lru_cache
 
 import numpy as np
@@ -134,13 +135,62 @@ class PgVectorStore:
         )
         self._init_table()
 
+    def _existing_vector_dim(self, conn) -> int | None:
+        """读取已存在的 knowledge_chunks.embedding 列的维度。
+
+        用途：检测「换了 Embedding 实现」的情况——例如先用离线词法（384 维）
+        入库，之后配上真实语义模型（1536 维）。此时旧表的列维度不匹配，
+        不仅插入会报错，即便维度凑巧相同，不同模型产出的向量也不在同一空间，
+        检索结果毫无意义。
+
+        Args:
+            conn: 已打开的数据库连接。
+
+        Returns:
+            现有向量列的维度；表或列不存在时返回 None。
+        """
+        # to_regclass 在表不存在时返回 NULL（而不是像 '表名'::regclass 那样抛错）
+        row = conn.execute(
+            text(
+                """
+                SELECT format_type(atttypid, atttypmod)
+                FROM pg_attribute
+                WHERE attrelid = to_regclass(:tbl)
+                  AND attname = 'embedding'
+                  AND NOT attisdropped
+                """
+            ),
+            {"tbl": _TABLE},
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        # 列类型形如 "vector(384)"，取出括号内的维度
+        m = re.search(r"\((\d+)\)", str(row[0]))
+        return int(m.group(1)) if m else None
+
     def _init_table(self) -> None:
-        """确保 pgvector 扩展已启用、知识块表与向量索引存在（幂等）。"""
-        # 维度由 embedder 动态决定：哈希回退 384 维，真实模型可能是 1536 等
+        """确保 pgvector 扩展已启用、知识块表与向量索引存在（幂等）。
+
+        额外处理维度变更：若已存在的向量列维度与当前 embedder 不一致，
+        说明 Embedding 实现被换过，旧向量无法复用——此时重建表并明确告警，
+        而不是留着它让后续插入/检索在运行时报出难以理解的错误。
+        """
+        # 维度由 embedder 动态决定：离线词法回退 384 维，真实模型可能是 1536 等
         dim = self.embedder.dimension
         with self.engine.begin() as conn:
             # 启用向量扩展（docker/init.sql 也会执行，这里保证非容器环境同样可用）
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+            existing = self._existing_vector_dim(conn)
+            if existing is not None and existing != dim:
+                logger.warning(
+                    "知识库向量维度不一致（库中 %d 维，当前 Embedding 产出 %d 维，"
+                    "实现=%s）：旧向量来自另一套 Embedding，无法与本模型的结果比较，"
+                    "将重建知识块表。请随后重新运行 scripts/ingest_knowledge.py 导入。",
+                    existing, dim, getattr(self.embedder, "name", "unknown"),
+                )
+                # 表与索引一并删除重建，避免残留的 HNSW 索引与新列维度冲突
+                conn.execute(text(f"DROP TABLE IF EXISTS {_TABLE}"))
             conn.execute(
                 text(
                     f"""
@@ -265,9 +315,14 @@ def get_vector_store(embedder):
     try:
         store = PgVectorStore(embedder, s.database_url)
         store.count()  # 建表成功不等于可查询，额外执行一次 COUNT 校验连接真正可用
-        logger.info("向量存储：PostgreSQL + pgvector")
+        logger.info(
+            "向量存储：PostgreSQL + pgvector（Embedding 实现=%s，语义=%s）",
+            getattr(embedder, "name", "unknown"),
+            getattr(embedder, "is_semantic", False),
+        )
         return store
     except Exception as e:  # noqa: BLE001
-        # 数据库不可用（未启动/无扩展/鉴权失败等）时降级，保证 RAG 离线仍可运行
-        logger.warning("pgvector 不可用（%s），回退到内存向量存储", e)
+        # 数据库不可用（未启动/无扩展/鉴权失败等）时降级，保证 RAG 离线仍可运行。
+        # 注意内存存储**不持久化**：进程重启后需要重新导入知识库。
+        logger.warning("pgvector 不可用（%s），回退到内存向量存储（不持久化）", e)
         return InMemoryVectorStore(embedder)

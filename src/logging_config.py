@@ -6,6 +6,10 @@
 
 调用一次 setup_logging() 后，项目中任何 logging.getLogger(__name__)
 取到的日志器都会继承根日志器上的统一配置。
+
+本模块同时负责**终端输出编码兜底**（见 configure_stdio）：CLI 会打印
+✓/✗/⚠ 一类符号，而 Windows 默认控制台编码（cp936/GBK）无法表示它们，
+不处理会直接抛 UnicodeEncodeError 把程序打挂。
 """
 
 from __future__ import annotations
@@ -23,6 +27,32 @@ _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
 
+def configure_stdio() -> None:
+    """让标准输出/错误在任意终端编码下都不会因字符不可表示而崩溃。
+
+    问题背景：Windows 上 Python 默认按控制台代码页（通常是 cp936）编码输出，
+    而本项目 CLI 会打印 ``✓``/``✗``/``⚠`` 等符号——它们在 GBK 里没有对应
+    字符，于是 ``print`` 直接抛 UnicodeEncodeError。
+
+    处理策略刻意保守：**保留终端原有编码**，只把错误处理改成 ``replace``。
+    这样中文仍然正常显示（GBK 覆盖中文），个别符号降级为 ``?``，
+    既不会崩溃，也不会因为在 GBK 控制台上强切 UTF-8 而让中文变成乱码。
+
+    兼容性：``reconfigure`` 是 Python 3.7+ 的流接口；被重定向到管道、
+    或已被测试框架替换过的流可能没有该方法，此时静默跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            # 流不可重配置（如已被关闭或替换）时忽略：输出编码问题是尽力而为，
+            # 绝不能因为兜底本身失败而影响主流程
+            pass
+
+
 def setup_logging(level: int = logging.INFO) -> None:
     """初始化根日志器（幂等，可安全重复调用）。
 
@@ -30,6 +60,9 @@ def setup_logging(level: int = logging.INFO) -> None:
         level: 控制台输出的最低日志级别，默认为 INFO；
             文件处理器固定记录 DEBUG 及以上级别，不受此参数影响。
     """
+    # 先兜底终端编码，避免后续任何 print/日志因字符不可表示而崩溃
+    configure_stdio()
+
     root = logging.getLogger()
     if root.handlers:  # 已配置过则直接返回，避免重复挂 handler 导致同一条日志打印多遍
         return

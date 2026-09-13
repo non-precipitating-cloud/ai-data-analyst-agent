@@ -13,6 +13,8 @@ import json
 # LangChain 消息类型
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+# LLM 调用的容错与用量记录
+from src.agent.observability import AgentLLMError, invoke_llm
 # 规划节点专用系统提示词（规定输出 JSON 数组的字段结构）
 from src.agent.prompts import PLANNER_SYSTEM
 # 图共享状态类型
@@ -47,12 +49,31 @@ def planner_node(state: AgentState) -> dict:
             f"数值字段：{numeric}"
         )
     )
-    # 发起 LLM 调用，期望返回纯 JSON 数组文本
-    resp = llm.invoke([SystemMessage(content=PLANNER_SYSTEM), prompt])
+    extra: dict = {}
+    try:
+        # 发起 LLM 调用，期望返回纯 JSON 数组文本
+        resp, record = invoke_llm(
+            [SystemMessage(content=PLANNER_SYSTEM), prompt], llm=llm, node="planner"
+        )
+        extra["llm_calls"] = [record]
+    except AgentLLMError as e:
+        # 降级：没有计划也能继续跑（agent 节点会自主决定调用哪些工具），
+        # 但必须在状态里留痕，避免后续报告把「没规划」当成「已按计划完成」
+        plan_text = "（规划阶段 LLM 不可用，未能生成分析计划）"
+        return {
+            "analysis_plan": [],
+            "observations": [f"[分析计划]\n{plan_text}"],
+            "messages": [AIMessage(content=f"[分析计划]\n{plan_text}")],
+            "llm_calls": [{"node": "planner", "success": False, "error": str(e)}],
+            "errors": [f"规划 LLM 调用失败：{e}"],
+            "degraded": ["规划阶段 LLM 不可用，本次分析未生成结构化计划。"],
+        }
+
     # 容错解析：LLM 若带围栏/废话也能抽出 JSON；解析失败统一降级为空计划
     plan = parse_json(resp.content)
     if not isinstance(plan, list):
         plan = []
+        extra["degraded"] = ["规划输出无法解析为 JSON 数组，已按无计划继续。"]
 
     # 把计划重新序列化为缩进 JSON 文本，便于写入观察记录与对话历史
     plan_text = json.dumps(plan, ensure_ascii=False, indent=2)
@@ -62,4 +83,5 @@ def planner_node(state: AgentState) -> dict:
         # 累加字段：在过程观察与对话历史中各留一份可读计划
         "observations": [f"[分析计划]\n{plan_text}"],
         "messages": [AIMessage(content=f"[分析计划]\n{plan_text}")],
+        **extra,
     }

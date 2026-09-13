@@ -48,10 +48,29 @@ class Settings(BaseSettings):
     max_steps: int = 15
     # Python 代码执行工具的超时时间（秒）
     python_timeout_seconds: int = 30
-    # 其他工具调用的超时时间（秒）
+    # 其他工具调用的超时时间（秒）。超时后该次调用返回超时错误给 LLM，
+    # 由模型决定换参数或换工具，而不是让整个 Agent 挂死。
     tool_timeout_seconds: int = 60
     # 工具结果落库/回传给模型前的最大截断字符数，防止上下文超长
     output_truncate_chars: int = 4000
+    # 同一工具**连续失败**达到此次数后，Agent 会收到「停止重试该工具」的
+    # 明确指令，避免把全部步数耗在同一个错误上
+    tool_max_consecutive_failures: int = 3
+    # 单步（一次 LLM 决策）允许并行发起的工具调用数量上限
+    max_tool_calls_per_step: int = 6
+    # 单次 LLM 调用失败后的额外重试次数（针对超时/连接类瞬时故障）
+    agent_llm_retries: int = 2
+    # 回灌给 LLM 的历史工具结果保留条数；更早的结果会被替换为摘要占位，
+    # 避免 15 步循环后把全部工具输出重复塞进每次请求（token 与稳定性问题）
+    keep_recent_tool_results: int = 6
+    # 数据文件体积上限（字节）。pandas 会整表读入内存，超大文件直接拒绝
+    max_dataset_bytes: int = 512 * 1024 * 1024
+
+    # ---- 连续对话（Agent Memory）----
+    # 注入到新一轮分析的最近历史轮数上限（防止无关历史污染当前任务）
+    memory_max_turns: int = 3
+    # 历史上下文注入的最大字符数
+    memory_max_chars: int = 4000
     # 除 datasets 目录外额外允许读取数据文件的根目录（环境变量传 JSON 数组），
     # 例如 Docker 中挂载外部数据卷：EXTRA_DATA_DIRS='["/data"]'
     # （变量名 = 字段名大写，写成 DATA_EXTRA_DIRS 会因 extra="ignore" 被静默忽略）
@@ -81,9 +100,15 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     # 向量化服务的基础 URL；为空时通常回退到 LLM_BASE_URL
     embedding_base_url: str = ""
-    # 向量化服务的 API Key；为空时通常回退到 LLM_API_KEY
+    # 向量化服务的 API Key；留空则回退到离线词法向量（非语义）
     embedding_api_key: str = ""
-    embedding_dim: int = 384          # 本地哈希回退向量的维度
+    # Embedding 实现选择：
+    #   auto（默认）= 有 EMBEDDING_API_KEY 用真实语义，否则回退离线词法并告警
+    #   openai      = 强制真实语义（缺 Key 直接报错，避免误以为在语义检索）
+    #   hash        = 强制离线词法回退（CI / 完全离线环境，检索仅字面匹配）
+    #   test        = 测试替身，仅供测试代码显式指定
+    embedding_provider: str = "auto"
+    embedding_dim: int = 384          # 本地词法回退向量的维度
     rag_top_k: int = 5                # 检索返回条数
 
     # ---- MCP ----

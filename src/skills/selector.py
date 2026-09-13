@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.agent.observability import invoke_llm
 from src.agent.utils import parse_json
 from src.llm import get_llm
 from src.skills.loader import get_all_skills
@@ -46,6 +47,7 @@ def select_skills(
     request: str,
     understanding: str = "",
     skills: list[SkillMetadata] | tuple[SkillMetadata, ...] | None = None,
+    usage_sink: list | None = None,
 ) -> list[str]:
     """选择相关 Skill（LLM 语义优先 + 关键词回退）。
 
@@ -53,6 +55,8 @@ def select_skills(
         request: 用户的原始分析需求。
         understanding: Agent 对任务的理解文本（可选，辅助 LLM 判断）。
         skills: 候选技能集合；为 None 时使用已发现的全部技能。
+        usage_sink: 可选的列表；LLM 调用记录（用量/耗时）会追加进去，
+            供上层写入 AgentState 做可观测性统计。传 None 则不记录。
 
     Returns:
         选中技能的 slug 列表（通常 1-3 个）；无候选或均未命中时返回空列表。
@@ -75,7 +79,13 @@ def select_skills(
                 f"候选 Skills：\n{skill_descs}"
             )
         )
-        resp = llm.invoke([SystemMessage(content=SKILL_SELECTION_SYSTEM), prompt])
+        resp, record = invoke_llm(
+            [SystemMessage(content=SKILL_SELECTION_SYSTEM), prompt],
+            llm=llm,
+            node="skill_selection",
+        )
+        if usage_sink is not None:
+            usage_sink.append(record)
         # 容错解析 LLM 返回的 JSON 数组（可能带 markdown 代码块等噪声）
         slugs = parse_json(resp.content)
         # 白名单校验：丢弃 LLM 幻觉出的不存在 slug
@@ -85,7 +95,9 @@ def select_skills(
             if valid:
                 return valid
     except Exception:  # noqa: BLE001 —— LLM 不可用/返回非法则静默回退
-        pass
+        if usage_sink is not None:
+            # 记录一次失败，便于在可观测性统计里看到「LLM 选择未生效」
+            usage_sink.append({"node": "skill_selection", "success": False})
 
     # 2) 关键词回退：不依赖 LLM 的确定性匹配，保证离线时技能机制仍可用
     return select_skills_by_keywords(request, skills)

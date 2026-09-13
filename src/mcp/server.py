@@ -18,6 +18,7 @@ import json
 from mcp.server.mcpserver import MCPServer
 
 from src.rag import get_retriever
+from src.tools.errors import KIND_EXECUTION_ERROR, tool_error
 from src.tools.chart_tool import generate_chart_file
 from src.tools.file_tools import _inspect_schema, _read_dataset
 from src.tools.python_tool import run_python
@@ -60,7 +61,11 @@ def read_dataset(path: str) -> str:
         return _json(_read_dataset(path))
     except Exception as e:  # noqa: BLE001
         # 工具级错误收敛为错误文本，由客户端依据内容判断，避免子进程崩溃
-        return f"读取失败：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR,
+            f"读取失败：{type(e).__name__}: {e}",
+            hint="请确认 path 位于 datasets/ 目录、文件存在且格式为 csv/xlsx/json。",
+        )
 
 
 @server.tool(name="get_schema", description="查看数据字段名称与数据类型。")
@@ -76,7 +81,9 @@ def get_schema(path: str) -> str:
     try:
         return _json(_inspect_schema(path))
     except Exception as e:  # noqa: BLE001
-        return f"获取 schema 失败：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR, f"获取 schema 失败：{type(e).__name__}: {e}"
+        )
 
 
 @server.tool(name="execute_sql", description="在 PostgreSQL 上执行只读 SQL（仅 SELECT/WITH/EXPLAIN）。")
@@ -101,7 +108,11 @@ def execute_sql(sql: str) -> str:
             }
         )
     except Exception as e:  # noqa: BLE001
-        return f"SQL 执行失败：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR,
+            f"SQL 执行失败：{type(e).__name__}: {e}",
+            hint="请检查列名/语法，或确认数据库已启动。",
+        )
 
 
 @server.tool(name="run_analysis", description="在沙箱中执行 Pandas/NumPy 分析代码。")
@@ -119,7 +130,9 @@ def run_analysis(code: str, dataset_path: str) -> str:
         # run_python 在受限沙箱中运行，隔离文件系统/网络风险
         return run_python(code, dataset_path)
     except Exception as e:  # noqa: BLE001
-        return f"执行出错：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR, f"执行出错：{type(e).__name__}: {e}"
+        )
 
 
 @server.tool(name="detect_outliers", description="检测数值列中的异常值（zscore / iqr）。")
@@ -158,7 +171,11 @@ def generate_chart(path: str, chart_type: str, x: str, y: str = "", title: str =
         out = generate_chart_file(path, chart_type, x, y, title)
         return f"图表已生成: {out}"
     except Exception as e:  # noqa: BLE001
-        return f"图表生成失败：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR,
+            f"图表生成失败：{type(e).__name__}: {e}",
+            hint="请检查 chart_type 与 x/y 字段名是否正确。",
+        )
 
 
 @server.tool(name="retrieve_knowledge", description="从数据分析知识库检索相关方法论知识。")
@@ -177,7 +194,9 @@ def retrieve_knowledge(query: str, top_k: int = 5) -> str:
         # 走 RAG 链路：query embedding → pgvector/内存库相似度检索 → Top-K
         results = get_retriever().retrieve(query, top_k)
     except Exception as e:  # noqa: BLE001
-        return f"知识库检索失败：{type(e).__name__}: {e}"
+        return tool_error(
+            KIND_EXECUTION_ERROR, f"知识库检索失败：{type(e).__name__}: {e}"
+        )
     if not results:
         return "知识库为空或未检索到相关内容。"
     # 每条只取前 240 字摘要，并标注分类与相似度分数，控制返回长度

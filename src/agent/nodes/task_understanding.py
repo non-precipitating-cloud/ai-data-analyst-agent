@@ -12,6 +12,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 # 任务理解节点专用系统提示词
 from src.agent.prompts import TASK_UNDERSTANDING_SYSTEM
+# LLM 调用的容错与用量记录
+from src.agent.observability import AgentLLMError, invoke_llm
 # 图共享状态类型
 from src.agent.state import AgentState
 # LLM 工厂
@@ -20,6 +22,9 @@ from src.llm import get_llm
 
 def task_understanding_node(state: AgentState) -> dict:
     """任务理解节点：调用 LLM 解析用户需求，输出一段任务理解文本。
+
+    本节点是「锦上添花」环节：任务理解失败不应让整次分析停下，
+    因此 LLM 不可用时退化为直接使用用户的原始需求文本，并记录降级原因。
 
     :param state: 图当前共享状态，必须包含 user_request；
                   dataset_metadata 在本节点通常尚未生成（字段可能为空）
@@ -33,9 +38,24 @@ def task_understanding_node(state: AgentState) -> dict:
 
     # 组装人类消息：原始需求 + 已知字段信息
     prompt = HumanMessage(content=f"用户分析需求：{request}\n\n数据集字段：{columns}")
-    # 系统提示词规定输出目标/指标/维度/分析类型四要素
-    resp = llm.invoke([SystemMessage(content=TASK_UNDERSTANDING_SYSTEM), prompt])
-    understanding = resp.content
+
+    try:
+        # 系统提示词规定输出目标/指标/维度/分析类型四要素
+        resp, record = invoke_llm(
+            [SystemMessage(content=TASK_UNDERSTANDING_SYSTEM), prompt],
+            llm=llm,
+            node="task_understanding",
+        )
+        understanding = resp.content
+        extra: dict = {"llm_calls": [record]}
+    except AgentLLMError as e:
+        # 降级：直接用原始需求作为任务理解，保证后续节点仍有可用输入
+        understanding = request
+        extra = {
+            "llm_calls": [{"node": "task_understanding", "success": False, "error": str(e)}],
+            "errors": [f"任务理解 LLM 调用失败：{e}"],
+            "degraded": ["任务理解阶段 LLM 不可用，已退化为直接使用原始需求文本。"],
+        }
 
     return {
         # 普通字段（覆盖语义）：保存任务理解供下游节点引用
@@ -43,4 +63,5 @@ def task_understanding_node(state: AgentState) -> dict:
         # 累加字段：同步到过程观察与对话历史
         "observations": [f"[任务理解]\n{understanding}"],
         "messages": [AIMessage(content=f"[任务理解]\n{understanding}")],
+        **extra,
     }

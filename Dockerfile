@@ -40,6 +40,8 @@ COPY datasets ./datasets
 COPY knowledge ./knowledge
 # 辅助脚本
 COPY scripts ./scripts
+# 离线评测脚本（可在容器内执行 `python -m eval.agent_eval` 验证镜像可用性）
+COPY eval ./eval
 
 # 创建非 root 用户并准备运行时目录（reports 是 docker-compose 的卷挂载点）
 # 遵循最小权限原则：应用不以 root 身份运行，降低容器被攻破后的风险

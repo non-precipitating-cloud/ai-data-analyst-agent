@@ -41,6 +41,40 @@ _IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]*)\)")
 # 图表文件名（含扩展名）
 _CHART_FILE_RE = re.compile(r"[\w\-]+\.(?:png|jpg|jpeg|svg)")
 
+# 报告中引用图表时使用的相对目录（报告落在 reports/，图表落在 reports/charts/）
+CHART_REL_DIR = "charts"
+
+
+def _match_columns(tokens: list[str], columns: list[str]) -> list[str] | None:
+    """用数据集真实列名把文件名片段贪心还原成字段名。
+
+    为什么需要：图表文件名形如 ``bar_region_sales_20260913_120000.png``，
+    字段之间也是下划线，因此 ``unit_price`` 这类含下划线的列名按位置切分
+    必然切错（会得到 "unit" 与 "price" 两个不存在的字段）。有了真实列名，
+    就能按「最长匹配」正确还原。
+
+    :param tokens: 去掉图表类型与时间戳后的文件名片段
+    :param columns: 数据集真实列名列表
+    :return: 还原出的字段名列表；无法完整还原时返回 None（由调用方退回旧策略）
+    """
+    if not tokens or not columns:
+        return None
+    known = set(columns)
+    matched: list[str] = []
+    rest = list(tokens)
+    while rest:
+        # 从最长片段开始尝试，优先匹配更具体的列名
+        for size in range(len(rest), 0, -1):
+            candidate = "_".join(rest[:size])
+            if candidate in known:
+                matched.append(candidate)
+                rest = rest[size:]
+                break
+        else:
+            # 整段都无法匹配到已知列名，说明文件名不符合预期
+            return None
+    return matched or None
+
 
 def is_valid_chart_path(path: str | Path) -> bool:
     """判断单个图表路径是否真实有效。
@@ -72,13 +106,18 @@ def validate_chart_paths(chart_paths: list[str]) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def chart_title_from_path(path: str | Path) -> str:
+def chart_title_from_path(path: str | Path, columns: list[str] | None = None) -> str:
     """根据图表文件名推导友好中文标题。
 
     文件名约定为「图表类型_X轴_Y轴_日期_时间.png」，例如
     line_month_sales.png → 月度销售额趋势。
 
+    当提供 ``columns``（数据集真实列名）时，会优先按列名做最长匹配来还原
+    字段，从而正确处理 ``unit_price`` 这类自身含下划线的列名；否则退回
+    按位置切分（兼容历史文件名与无画像信息的场景）。
+
     :param path: 图表文件路径
+    :param columns: 数据集真实列名；为 None 时使用按位置切分的旧策略
     :return: 中文化的图表标题；无法识别类型时退回原始文件名
     """
     name = Path(path).stem
@@ -89,6 +128,12 @@ def chart_title_from_path(path: str | Path) -> str:
     # 去掉末尾时间戳（YYYYMMDD + HHMMSS 两段）
     if len(core) >= 2 and core[-2].isdigit() and len(core[-2]) == 8:
         core = core[:-2]
+
+    # 优先用真实列名还原（可正确处理含下划线的字段名）
+    matched = _match_columns(core, columns or []) if columns else None
+    if matched is not None and len(matched) <= 2:
+        core = matched
+
     x = core[0] if core else ""
     y = core[1] if len(core) > 1 else ""
     # 字段名翻译为中文；映射表中没有的保留原名
@@ -144,13 +189,15 @@ def build_report_context(state: dict) -> dict:
 
     # 图表校验：只保留磁盘上真实存在且扩展名合法的图表
     valid_charts, _ = validate_chart_paths(generated_charts)
+    # 数据集的真实列名：用于把图表文件名准确还原成字段名（含下划线的情况）
+    known_columns = list(meta.get("columns") or [])
     # 为每张图表整理路径、文件名、中文标题及报告中使用的相对引用路径
     chart_items = [
         {
             "path": p,
             "name": Path(p).name,
-            "title": chart_title_from_path(p),
-            "relative": f"charts/{Path(p).name}",
+            "title": chart_title_from_path(p, known_columns),
+            "relative": f"{CHART_REL_DIR}/{Path(p).name}",
         }
         for p in valid_charts
     ]
@@ -186,6 +233,8 @@ def build_report_context(state: dict) -> dict:
         # 有效图表文件名集合：报告中只允许引用这些名字
         "valid_chart_names": {Path(p).name for p in valid_charts},
         "errors": state.get("errors") or [],
+        # 降级原因：报告「分析局限性」章节必须如实呈现
+        "degraded": state.get("degraded") or [],
     }
 
 
@@ -205,8 +254,13 @@ def validate_report(content: str, valid_chart_names: set[str] | None = None) -> 
 
     text = content.strip()
 
-    # 模板占位符 / JSON 残留：出现任一即说明 LLM 没把模板填完
-    for placeholder in ("{{", "}}", "<chart_path>", "{chart", "TODO", "FIXME"):
+    # 模板占位符 / 未填充残留。
+    # 注意 `}}` 单独出现并不代表占位符——报告里引用一段 JSON 数据（如
+    # `{"a":{"b":1}}`）就会产生连续的右花括号。因此只把 Jinja 风格的
+    # `{{ ... }}` 成对形式判定为占位符，避免对正常报告产生误报。
+    if re.search(r"\{\{.*?\}\}", text, flags=re.DOTALL):
+        issues.append("发现模板占位符: {{ ... }}")
+    for placeholder in ("<chart_path>", "{chart", "TODO", "FIXME"):
         if placeholder in text:
             issues.append(f"发现占位符/残留: {placeholder}")
 
@@ -224,22 +278,110 @@ def validate_report(content: str, valid_chart_names: set[str] | None = None) -> 
     return (not issues), issues
 
 
+def _normalize_chart_url(url: str, fname: str) -> str:
+    """把图表图片地址规范化为报告中可用的相对路径 ``charts/<文件名>``。
+
+    报告保存在 ``reports/`` 下、图表保存在 ``reports/charts/`` 下，因此只有
+    ``charts/<文件名>`` 这种相对写法才能在 Markdown 预览里正确加载。LLM 可能
+    写成绝对路径、``./charts/x.png``、甚至只有裸文件名——它们指向的文件确实
+    存在，但链接是坏的。既然白名单已确认文件真实存在，这里统一改写为规范路径。
+
+    :param url: LLM 写入的原始图片地址
+    :param fname: 该地址对应的文件名（已确认在白名单内）
+    :return: 规范化后的相对路径
+    """
+    # 已经规范的写法原样返回，避免无谓改写
+    if url == f"{CHART_REL_DIR}/{fname}":
+        return url
+    return f"{CHART_REL_DIR}/{fname}"
+
+
 def sanitize_report(content: str, valid_chart_names: set[str]) -> str:
-    """清理报告中引用了不存在图表的 Markdown 图片标签。
+    """清理报告中引用了不存在图表的图片标签，并规范化保留项的路径。
+
+    两步处理：
+    1. 图片文件名不在白名单 → 整条标签删除（防止报告引用不存在/幻觉出的图表）；
+    2. 文件名在白名单 → 把地址改写为 ``charts/<文件名>``，保证链接真的能打开。
 
     :param content: 原始 Markdown 报告
     :param valid_chart_names: 允许保留的图表文件名集合（白名单）
-    :return: 清理后的报告；非法图片标签整体替换为空字符串
+    :return: 清理并规范化后的报告
     """
     def _repl(m: re.Match) -> str:
         """正则替换回调：按图片 URL 的文件名是否在白名单决定去留。
 
         :param m: 匹配到的图片标签正则 Match 对象
-        :return: 文件名合法则原样返回整个标签，否则返回空串将其删除
+        :return: 文件名合法则返回路径规范化后的标签，否则返回空串将其删除
         """
         url = m.group(1)
         fname = Path(url).name
-        return m.group(0) if fname in valid_chart_names else ""
+        if fname not in valid_chart_names:
+            # 引用了不存在的图表：整条删除，而不是留下一个打不开的链接
+            return ""
+        normalized = _normalize_chart_url(url, fname)
+        # 只替换 URL 部分，保留作者写的 alt 文本
+        return m.group(0).replace(f"]({url})", f"]({normalized})")
 
     # 用回调逐个处理所有 ![...](...) 图片引用
     return _IMAGE_RE.sub(_repl, content)
+
+
+def build_degraded_report(ctx: dict, reason: str) -> str:
+    """LLM 不可用时，用确定性模板把真实结果整理成 Markdown 报告。
+
+    设计原则：**只搬运，不推断**。模板里出现的每一个数字都直接来自工具结果
+    原文，不生成任何归纳性结论。这样即使模型不可用，用户仍能拿到一份数据可
+    追溯的报告，且不会把「未经分析的原始数据」伪装成分析结论。
+
+    :param ctx: build_report_context 产出的上下文字典
+    :param reason: 降级原因（会写入报告开头）
+    :return: Markdown 报告文本
+    """
+    meta = ctx.get("dataset_metadata") or {}
+    lines: list[str] = [
+        "# AI 数据分析报告",
+        "",
+        "> ⚠️ **本报告为降级输出**：报告生成阶段大模型不可用，以下内容由确定性模板"
+        "直接汇总工具原始结果，**未经过模型归纳**，因此不含核心发现与原因推断。",
+        "",
+        f"- 降级原因：{reason}",
+        f"- 用户需求：{ctx.get('user_request', '')}",
+        "",
+        "## 分析概览",
+        f"- 数据集行数：{meta.get('num_rows', '未获取')}",
+        f"- 数据集列数：{meta.get('num_columns', '未获取')}",
+        f"- 字段：{meta.get('columns', [])}",
+        "",
+        "## 工具调用摘要",
+        ctx.get("tool_call_summary", "（无）"),
+        "",
+        "## 工具结果（原始数据）",
+    ]
+    results = ctx.get("tool_results") or []
+    if results:
+        for tr in results:
+            lines += [
+                f"### {tr.get('name', '?')}（{tr.get('status', '?')}）",
+                "```",
+                str(tr.get("result", "")),
+                "```",
+                "",
+            ]
+    else:
+        lines += ["（本次未取得任何工具结果）", ""]
+
+    charts = ctx.get("generated_charts") or []
+    lines += ["## 图表"]
+    if charts:
+        lines += [f"![{c['title']}]({c['relative']})" for c in charts]
+    else:
+        lines += ["本次分析未生成图表。"]
+    lines.append("")
+
+    lines += ["## 分析局限性", "- 报告由确定性模板生成，未包含模型提炼的洞察与因果推断。"]
+    for d in ctx.get("degraded") or []:
+        lines.append(f"- {d}")
+    if ctx.get("errors"):
+        lines.append("- 过程错误：")
+        lines += [f"  - {e}" for e in ctx["errors"][:10]]
+    return "\n".join(lines)

@@ -37,7 +37,11 @@ from src.agent.state import AgentState
 from src.config.settings import get_settings
 
 
-def make_initial_state(dataset_path: str, user_request: str) -> AgentState:
+def make_initial_state(
+    dataset_path: str,
+    user_request: str,
+    conversation_context: str = "",
+) -> AgentState:
     """构造图运行所需的初始状态字典。
 
     在图执行开始前调用一次，把系统提示词、用户的数据文件路径与分析需求
@@ -46,17 +50,26 @@ def make_initial_state(dataset_path: str, user_request: str) -> AgentState:
 
     :param dataset_path: 用户上传的数据集文件路径（如 CSV/Excel）
     :param user_request: 用户用自然语言描述的分析需求
+    :param conversation_context: 前几轮对话的摘要上下文（连续追问时注入）；
+        为空串表示这是一次全新的、无历史的任务
     :return: 符合 AgentState 结构的初始状态字典
     """
     settings = get_settings()
+    # 首轮消息：数据路径 + 分析需求；有历史时把历史摘要一并附上，
+    # 使「为什么？」这类追问能直接复用上一次的分析结论
+    first_turn = f"数据文件：{dataset_path}\n分析需求：{user_request}"
+    if conversation_context:
+        first_turn = f"{conversation_context}\n\n{first_turn}"
+
     return {
-        # 对话历史：首条为系统人设，次条为本次任务（数据路径 + 分析需求）
+        # 对话历史：首条为系统人设，次条为本次任务（含可选的历史上下文）
         "messages": [
             SystemMessage(content=AGENT_SYSTEM),
-            HumanMessage(content=f"数据文件：{dataset_path}\n分析需求：{user_request}"),
+            HumanMessage(content=first_turn),
         ],
         "user_request": user_request,
         "dataset_path": dataset_path,
+        "conversation_context": conversation_context,
         # 数据画像结果（由 profiler 节点填充）
         "dataset_metadata": {},
         # 分析计划（由 planner 节点产出的步骤列表）
@@ -69,22 +82,26 @@ def make_initial_state(dataset_path: str, user_request: str) -> AgentState:
         "max_steps": settings.max_steps,
         # running 表示分析进行中，report 节点完成后置为 done
         "status": "running",
-        # 以下三类均为「累加字段」：节点返回新片段，LangGraph 自动追加
+        # 以下均为「累加字段」：节点返回新片段，LangGraph 自动追加
         "observations": [],
         "insights": [],
         "errors": [],
         "tool_calls": [],
         "tool_results": [],
+        "llm_calls": [],
         "generated_charts": [],
+        "degraded": [],
     }
 
 
 def route_after_agent(state: AgentState) -> str:
     """条件路由：决定 agent 节点（LLM 决策）之后的走向。
 
-    判断依据有两个：
-    1. LLM 最新一条消息是否携带 tool_calls（是否请求调用工具）；
-    2. 当前步数是否仍小于最大步数上限。
+    三条终止路径，任一满足即结束工具循环：
+    1. LLM 不再请求工具（正常收敛）；
+    2. 达到 max_steps 步数上限（硬性防死循环）；
+    3. 本轮请求的工具调用**全部**是已成功执行过的重复调用——再执行一遍
+       不会产生任何新信息，继续循环只会白白烧掉步数与 token。
 
     :param state: 图当前共享状态
     :return: "tools" 表示继续执行工具调用；"insight" 表示结束循环、进入洞察
@@ -92,14 +109,37 @@ def route_after_agent(state: AgentState) -> str:
     # 取对话中最后一条消息（即 LLM 刚做出的决策）；无消息时置空
     last = state.get("messages", [None])[-1] if state.get("messages") else None
     # tool_calls 非空表示 LLM 本轮想调用工具而非输出最终结论
-    has_tool_calls = bool(getattr(last, "tool_calls", None))
+    tool_calls = getattr(last, "tool_calls", None) or []
     step_count = state.get("step_count", 0)
     max_steps = state.get("max_steps", 15)
 
-    # 仍有工具要调且未超步数上限 → 进入 tools 节点，否则跳出循环去做洞察
-    if has_tool_calls and step_count < max_steps:
-        return "tools"
-    return "insight"
+    if not tool_calls:
+        return "insight"
+    if step_count >= max_steps:
+        return "insight"
+    if _no_progress(state, tool_calls):
+        # 无进展：提前收敛，由 insight 节点说明「未能取得新数据」
+        return "insight"
+    return "tools"
+
+
+def _no_progress(state: AgentState, tool_calls: list) -> bool:
+    """判断本轮的工具调用是否全部为「已成功执行过的重复调用」。
+
+    :param state: 图当前共享状态（读其中的 tool_calls 台账）
+    :param tool_calls: LLM 本轮请求的工具调用列表
+    :return: 全部重复（无新信息可获取）返回 True
+    """
+    # 延迟导入：避免 graph 与 nodes 之间在模块加载期形成循环依赖
+    from src.agent.nodes.tool_calling import call_signature, executed_signatures
+
+    done = executed_signatures(state)
+    if not done:
+        return False
+    return all(
+        call_signature(tc.get("name", ""), tc.get("args") or {}) in done
+        for tc in tool_calls
+    )
 
 
 def build_graph():

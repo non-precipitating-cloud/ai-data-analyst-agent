@@ -40,9 +40,13 @@ class AgentState(TypedDict, total=False):
     selected_skills: list[str]
     skills_context: str
 
-    # 工具调用记录（累加）：每次调用的入参/状态，以及工具返回的原始结果
+    # 工具调用记录（累加）：每次调用的入参/状态/耗时，以及工具返回的原始结果
     tool_calls: Annotated[list[dict[str, Any]], operator.add]
     tool_results: Annotated[list[dict[str, Any]], operator.add]
+
+    # LLM 调用记录（累加）：节点名/模型/token 用量/耗时/成败，
+    # 用于完整追踪一次 Agent 运行并落库（见 src/agent/observability.py）
+    llm_calls: Annotated[list[dict[str, Any]], operator.add]
 
     # 实际生成的图表文件路径（累加）：仅记录 generate_chart 成功产出的文件
     generated_charts: Annotated[list[str], operator.add]
@@ -57,6 +61,13 @@ class AgentState(TypedDict, total=False):
     final_report: str
     report_path: str
     status: str
+
+    # 降级标记（累加）：LLM 不可用、步数耗尽、工具反复失败等情况下记录原因，
+    # 最终写入报告「分析局限性」章节，避免给出「看似完整」的误导性结论
+    degraded: Annotated[list[str], operator.add]
+
+    # 连续对话：由调用方（CLI）注入的历史上下文文本，空串表示无历史
+    conversation_context: str
 
     # 控制：工具调用循环的当前步数与上限，用于防止 Agent 无限循环
     step_count: int

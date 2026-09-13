@@ -20,6 +20,7 @@ import pandas as pd
 from langchain_core.tools import tool
 
 from src.config.settings import get_settings
+from src.tools.errors import describe_exception, tool_error
 
 
 def _native(value: Any) -> Any:
@@ -56,7 +57,7 @@ def load_dataframe(path: str | Path) -> pd.DataFrame:
         pd.DataFrame: 加载后的数据表。
     异常：
         FileNotFoundError: 安全校验后的路径不存在。
-        ValueError: 文件扩展名不在支持列表内。
+        ValueError: 文件扩展名不在支持列表内，或文件超过体积上限。
     """
     settings = get_settings()
     # 路径安全校验：解析后必须落在允许的数据目录内，阻断目录穿越
@@ -64,6 +65,17 @@ def load_dataframe(path: str | Path) -> pd.DataFrame:
 
     if not p.exists():
         raise FileNotFoundError(f"文件不存在: {p}")
+
+    # 体积上限：pandas 会把整个文件读进内存，超大文件（如几 GB CSV）
+    # 会直接拖垮进程。这里在读取前快速失败，给出可操作的提示，
+    # 而不是让 Agent 卡在工具调用上直到超时。
+    size = p.stat().st_size
+    if size > settings.max_dataset_bytes:
+        raise ValueError(
+            f"数据文件过大（{size / 1024 / 1024:.1f} MB，上限 "
+            f"{settings.max_dataset_bytes / 1024 / 1024:.0f} MB）。"
+            "请先抽样或裁剪后再分析。"
+        )
 
     suffix = p.suffix.lower()
     if suffix == ".csv":
@@ -179,15 +191,28 @@ def _run_tool(handler, path: str) -> str:
         handler: 真正干活的内部函数（_read_dataset / _inspect_schema / _profile_dataset）。
         path: 用户提供的数据文件路径（内部会做目录边界安全校验）。
     返回值：
-        str: 正常结果的 JSON 字符串；出错时为“错误：...”中文提示。
+        str: 正常结果的 JSON 字符串；出错时为结构化中文错误文本
+        （含错误类型与修复建议，便于 Agent 自我纠正）。
     """
     try:
         return _json_dumps(handler(path))
     except (PermissionError, FileNotFoundError, ValueError) as e:
-        # 路径越界、文件不存在、格式/字段错误：给出明确中文原因
-        return f"错误：{type(e).__name__}: {e}"
+        # 路径越界、文件不存在、格式/体积问题：给出明确中文原因与类型
+        kind, retryable = describe_exception(e)
+        return tool_error(
+            kind,
+            f"{type(e).__name__}: {e}",
+            hint="请确认路径位于 datasets/ 目录、文件存在且格式为 csv/xlsx/json。",
+            retryable=retryable,
+        )
     except Exception as e:  # 兜底：读取/解析阶段的其他意外
-        return f"读取失败：{type(e).__name__}: {e}"
+        kind, retryable = describe_exception(e)
+        return tool_error(
+            kind,
+            f"读取失败：{type(e).__name__}: {e}",
+            hint="文件可能已损坏或编码异常，可先用 execute_python 检查。",
+            retryable=retryable,
+        )
 
 
 @tool

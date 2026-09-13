@@ -63,14 +63,80 @@ plt.rcParams["font.sans-serif"] = _available_cjk_fonts()
 # 用中文字体后负号会显示异常，关闭 unicode_minus 让坐标轴负号正常渲染
 plt.rcParams["axes.unicode_minus"] = False
 
+import re  # noqa: E402
+
 import pandas as pd  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 
 from src.config.settings import get_settings  # noqa: E402
+from src.tools.errors import (  # noqa: E402
+    KIND_INVALID_ARGUMENT,
+    KIND_NOT_FOUND,
+    KIND_UNSUPPORTED,
+    describe_exception,
+    tool_error,
+)
 from src.tools.file_tools import load_dataframe  # noqa: E402
 
 # 支持的图表类型白名单（小写）
 SUPPORTED_TYPES = {"bar", "line", "scatter", "hist", "box"}
+
+# 各图表类型对 y 字段的要求：
+# - required：必须提供 y，否则画不出有意义的图（折线/散点本质是 x-y 关系）
+# - optional：y 可省略，省略时退化为计数/单变量分布
+_Y_REQUIREMENT = {
+    "bar": "optional",
+    "line": "required",
+    "scatter": "required",
+    "hist": "optional",
+    "box": "optional",
+}
+
+
+class ChartArgumentError(ValueError):
+    """图表参数不合法（类型不支持、字段不存在、缺少必需参数等）。
+
+    与普通 ValueError 的区别：它额外携带错误类型、可选值与修复建议，
+    由 @tool 层渲染成结构化的中文错误文本回传给 LLM，便于其自我纠正。
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        *,
+        options: list | None = None,
+        hint: str = "",
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.options = options
+        self.hint = hint
+        self.retryable = retryable
+
+    def to_text(self) -> str:
+        """渲染成与其他工具一致的结构化错误文本。"""
+        return tool_error(
+            self.kind,
+            str(self),
+            options=self.options,
+            hint=self.hint,
+            retryable=self.retryable,
+        )
+
+
+def _safe_name_part(value: str) -> str:
+    """把字段名清洗为可安全用于文件名的片段。
+
+    字段名可能含空格、斜杠、中文标点等，直接拼进文件名会产生非法路径或
+    目录穿越。这里只保留单词字符、中文与连字符，其余替换为下划线。
+
+    :param value: 原始字段名（或 y 的占位符）
+    :return: 清洗后的文件名片段；清洗后为空时返回 "field"
+    """
+    cleaned = re.sub(r"[^\w一-鿿\-]+", "_", value or "").strip("_")
+    return cleaned or "field"
 
 
 def _as_datetime(series: pd.Series) -> pd.Series:
@@ -169,20 +235,61 @@ def generate_chart_file(
     返回值：
         str: 生成的 PNG 文件绝对路径。
     异常：
-        ValueError: 图表类型不支持，或 x/y 字段不存在。
-        FileNotFoundError: 数据文件不存在。
+        ChartArgumentError: 图表类型不支持、x/y 字段不存在或缺少必需参数
+            （携带错误类型与修复建议，由 @tool 层转成结构化错误文本）。
     """
     settings = get_settings()
-    chart_type = chart_type.lower()
+    chart_type = (chart_type or "").strip().lower()
     if chart_type not in SUPPORTED_TYPES:
-        raise ValueError(f"不支持的图表类型: {chart_type}，支持 {sorted(SUPPORTED_TYPES)}")
+        raise ChartArgumentError(
+            KIND_UNSUPPORTED,
+            f"不支持的图表类型: {chart_type!r}",
+            options=sorted(SUPPORTED_TYPES),
+            hint="请从上述类型中选择一种后重试。",
+        )
 
     # 复用文件工具的统一加载与路径安全校验逻辑
-    df = load_dataframe(path)
+    try:
+        df = load_dataframe(path)
+    except Exception as e:  # noqa: BLE001 —— 转成带类型的参数错误，便于 LLM 分辨
+        kind, retryable = describe_exception(e)
+        raise ChartArgumentError(
+            kind,
+            f"无法读取数据集 {path}：{type(e).__name__}: {e}",
+            hint="请确认 path 指向 datasets/ 目录下真实存在的文件。",
+            retryable=retryable,
+        ) from e
+
+    if not x:
+        raise ChartArgumentError(
+            KIND_INVALID_ARGUMENT,
+            "缺少横轴字段 x",
+            options=list(df.columns),
+            hint="请指定一个已存在的字段作为横轴。",
+        )
     if x not in df.columns:
-        raise ValueError(f"字段 '{x}' 不存在: {list(df.columns)}")
+        raise ChartArgumentError(
+            KIND_NOT_FOUND,
+            f"横轴字段 '{x}' 不存在",
+            options=list(df.columns),
+            hint="请从上列字段中选择已存在的列名。",
+        )
     if y and y not in df.columns:
-        raise ValueError(f"字段 '{y}' 不存在: {list(df.columns)}")
+        raise ChartArgumentError(
+            KIND_NOT_FOUND,
+            f"纵轴字段 '{y}' 不存在",
+            options=list(df.columns),
+            hint="请从上列字段中选择已存在的数值列，或留空 y 改画分布图。",
+        )
+    # 折线图/散点图必须给出 y：否则绘制时会抛 KeyError('')，
+    # LLM 只能看到一句含糊的报错，无法判断该怎么改
+    if _Y_REQUIREMENT[chart_type] == "required" and not y:
+        raise ChartArgumentError(
+            KIND_INVALID_ARGUMENT,
+            f"{chart_type} 图必须提供纵轴字段 y",
+            options=df.select_dtypes(include="number").columns.tolist(),
+            hint="请补上数值型 y；若只想看分布，可改用 hist 或 box。",
+        )
 
     _build_plot(df, chart_type, x, y, title)
 
@@ -190,7 +297,8 @@ def generate_chart_file(
     settings.charts_dir.mkdir(parents=True, exist_ok=True)
     # 时间戳命名：同一数据集多次出图不会互相覆盖
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{chart_type}_{x}_{y or 'all'}_{stamp}.png"
+    # 字段名先清洗再拼进文件名，避免空格/斜杠造成非法路径
+    fname = f"{chart_type}_{_safe_name_part(x)}_{_safe_name_part(y) if y else 'all'}_{stamp}.png"
     out_path = settings.charts_dir / fname
     # bbox_inches="tight" 自动裁掉多余白边，保留倾斜的横轴标签
     plt.savefig(out_path, dpi=110, bbox_inches="tight")
@@ -207,11 +315,20 @@ def generate_chart(path: str, chart_type: str, x: str, y: str = "", title: str =
     x 为横轴字段；y 为数值字段（hist 可省略 y）。
 
     返回值：
-        str: 成功为 "图表已生成: <路径>"；任何异常都被捕获并转成失败提示字符串，
-        保证工具调用不会中断 Agent 的执行链路。
+        str: 成功为 "图表已生成: <路径>"；任何异常都被捕获并转成结构化错误文本
+        （含错误类型与修复建议），保证工具调用不会中断 Agent 的执行链路。
     """
     try:
         out = generate_chart_file(path, chart_type, x, y, title)
         return f"图表已生成: {out}"
-    except Exception as e:
-        return f"图表生成失败：{type(e).__name__}: {e}"
+    except ChartArgumentError as e:
+        # 参数类错误：直接给出错误类型 + 可选值 + 建议，LLM 通常一次就能改对
+        return e.to_text()
+    except Exception as e:  # noqa: BLE001 —— 绘制期异常兜底，仍不抛出
+        kind, retryable = describe_exception(e)
+        return tool_error(
+            kind,
+            f"图表生成失败：{type(e).__name__}: {e}",
+            hint="请检查字段类型与数据分布后重试，或改用其他图表类型。",
+            retryable=retryable,
+        )

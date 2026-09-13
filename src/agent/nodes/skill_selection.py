@@ -28,9 +28,11 @@ def skill_selection_node(state: AgentState) -> dict:
     """
     # 加载本地（或注册中心中）全部可用 Skill
     skills = get_all_skills()
+    # LLM 选择过程的调用记录：由 select_skills 追加，随后写入状态供落库统计
+    llm_calls: list[dict] = []
     # 结合用户需求与任务理解文本做相关性匹配，返回命中 Skill 的 slug 列表
     slugs = select_skills(
-        state["user_request"], state.get("understanding", ""), skills
+        state["user_request"], state.get("understanding", ""), skills, usage_sink=llm_calls
     )
     # 用 slug 过滤出完整的 Skill 对象，供格式化使用
     selected = [s for s in skills if s.slug in slugs]
@@ -45,4 +47,5 @@ def skill_selection_node(state: AgentState) -> dict:
         # 对话历史中同时保留名称标签与方法论正文
         "messages": [AIMessage(content=f"[已选择 Skills]\n{label}\n\n{context}")],
         "observations": [f"[Skill 选择]\n已选择: {label}"],
+        "llm_calls": llm_calls,
     }

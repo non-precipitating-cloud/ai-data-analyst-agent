@@ -16,10 +16,13 @@ from pathlib import Path
 # LangChain 消息类型
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+# LLM 调用的容错与用量记录
+from src.agent.observability import AgentLLMError, invoke_llm
 # 报告节点专用系统提示词（17 个章节与防编造约束）
 from src.agent.prompts import REPORT_SYSTEM
-# 报告辅助函数：上下文构建、虚假图片清理、质量校验
+# 报告辅助函数：上下文构建、虚假图片清理、质量校验、降级兜底
 from src.agent.report_builder import (
+    build_degraded_report,
     build_report_context,
     sanitize_report,
     validate_report,
@@ -133,6 +136,15 @@ def _build_prompt(ctx: dict) -> str:
     else:
         parts.append("# 实际生成的图表清单\n（无）")
 
+    # 第 10 节（可选）：降级/未完成情况。
+    # 必须显式告知模型，否则它会把「没分析出来」写成「没有问题」，
+    # 这是数据分析里危害最大的一类误导。
+    if ctx.get("degraded"):
+        parts.append(
+            "# 本次分析的降级/未完成情况（必须写入「分析局限性」章节）\n"
+            + "\n".join(f"- {d}" for d in ctx["degraded"])
+        )
+
     # 小节之间用空行分隔，拼成最终提示词
     return "\n\n".join(parts)
 
@@ -151,9 +163,23 @@ def report_node(state: AgentState) -> dict:
 
     # 用系统提示词（章节规范）+ 人类提示词（真实素材）调用 LLM 撰写报告
     prompt = HumanMessage(content=_build_prompt(ctx))
-    resp = llm.invoke([SystemMessage(content=REPORT_SYSTEM), prompt])
-    # 剥离模型可能误加的代码块围栏
-    content = _strip_code_fence(resp.content)
+    extra: dict = {}
+    try:
+        resp, record = invoke_llm(
+            [SystemMessage(content=REPORT_SYSTEM), prompt], llm=llm, node="report"
+        )
+        # 剥离模型可能误加的代码块围栏
+        content = _strip_code_fence(resp.content)
+        extra["llm_calls"] = [record]
+    except AgentLLMError as e:
+        # 报告阶段 LLM 不可用：用确定性模板把真实工具结果整理成报告落盘。
+        # 宁可交付一份「没有模型润色、但每个数字都可追溯」的报告，
+        # 也不要因为一次 LLM 故障丢失整轮分析成果。
+        logger.error("报告 LLM 调用失败，改用确定性模板生成：%s", e)
+        content = build_degraded_report(ctx, str(e))
+        extra["llm_calls"] = [{"node": "report", "success": False, "error": str(e)}]
+        extra["errors"] = [f"报告 LLM 调用失败：{e}"]
+        extra["degraded"] = ["报告阶段 LLM 不可用，已改用确定性模板输出原始结果。"]
 
     # 清理虚假图表引用 + 质量检查（不中断）
     # 先删除引用白名单外图片的标签，再检查占位符/章节/残留虚假引用
@@ -176,4 +202,5 @@ def report_node(state: AgentState) -> dict:
         # 标记工作流正常走到终点
         "status": "done",
         "messages": [AIMessage(content=f"[报告已生成] {path}")],
+        **extra,
     }

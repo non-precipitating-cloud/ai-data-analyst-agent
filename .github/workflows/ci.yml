@@ -47,6 +47,11 @@ jobs:
       - name: 运行 pytest（需要真实 PG/Redis 的集成测试在环境缺失时自动 skip）
         run: pytest --cov=src --cov-report=term-missing
 
+      # 单独跑一次评测，让「Agent 行为评测」在 CI 日志里独立可见
+      # （tests/test_agent_eval.py 已把同一批场景纳入 pytest，这里是为了可读性）
+      - name: Agent 离线评测（真实工具执行 + 脚本化 LLM，全离线无需 API Key）
+        run: python -m eval.agent_eval
+
   # ===== 任务二：构建 Docker 镜像（验证可构建 + 中文字体层）=====
   # main 分支推送时额外把镜像推送到 GitHub Container Registry（ghcr.io）
   docker:

@@ -28,6 +28,13 @@ services:
     container_name: analyst-redis
     ports:
       - "6379:6379"                      # 映射到宿主机 6379，本机可直连调试
+    healthcheck:
+      # redis-cli ping 返回 PONG 即视为就绪；agent 据此等待 Redis 起来再启动，
+      # 避免启动瞬间的会话/缓存写入直接落到降级路径
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # ===== AI 分析师 Agent 应用本身 =====
   agent:
@@ -43,7 +50,15 @@ services:
       postgres:
         condition: service_healthy       # 等数据库健康检查通过后再启动 Agent
       redis:
-        condition: service_started       # Redis 启动后即可（无健康检查）
+        condition: service_healthy       # Redis 通过 PING 后再启动，保证会话/缓存可用
+    # 容器存活自检：能 import 应用包即说明依赖装齐、代码路径可用。
+    # 这不是业务健康检查（Agent 是按需执行的 CLI），只用于尽早暴露镜像问题。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import src.agent.graph"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     volumes:
       - reports_data:/app/reports        # 生成的分析报告写到命名卷，容器重建后报告仍保留
     stdin_open: true                     # 保持标准输入打开（配合交互式运行）

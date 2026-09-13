@@ -73,6 +73,7 @@ class PersistenceService:
         self.dataset_id: int | None = None  # 当前数据集 ID
         self._db_on: bool | None = None     # 数据库可用性缓存（None=未探测）
         self._redis_on: bool | None = None  # Redis 可用性缓存（None=未探测）
+        self._started_at: datetime | None = None  # 本次运行起始时刻（算总耗时用）
 
     # ---- 可用性 ----
     def _db_ok(self) -> bool:
@@ -111,6 +112,8 @@ class PersistenceService:
         self.task_id = None
         self.run_id = None
         self.dataset_id = None
+        # 记录起始时刻，收尾时据此计算本次运行总耗时
+        self._started_at = _now()
 
         if self._db_ok():
             try:
@@ -198,6 +201,7 @@ class PersistenceService:
         result: str | None,
         status: str,
         error: str | None = None,
+        duration_ms: int = 0,
     ) -> None:
         """记录一次工具调用；对有价值的分析工具同时写一条 analysis_results。
 
@@ -208,6 +212,7 @@ class PersistenceService:
             result: 工具结果文本（会按配置长度截断）。
             status: 调用状态。
             error: 失败时的错误信息。
+            duration_ms: 本次调用耗时（毫秒）。
         """
         if not self._db_ok():
             return
@@ -215,7 +220,7 @@ class PersistenceService:
             # 结果文本过长时截断，避免单行过大、撑爆模型上下文
             truncated = (result or "")[: get_settings().output_truncate_chars]
             self._repo.add_tool_call(
-                self.run_id, name, tool_type, arguments, truncated, status, error
+                self.run_id, name, tool_type, arguments, truncated, status, error, duration_ms
             )
             # 仅画像/统计/相关性/异常值/图表类工具额外沉淀为结构化分析结果
             rt = result_type_of(name)
@@ -225,6 +230,50 @@ class PersistenceService:
                 )
         except Exception as e:  # noqa: BLE001
             logger.warning("记录工具调用失败：%s", e)
+
+    def record_llm_calls(self, records: list[dict] | None) -> dict:
+        """批量记录 LLM 调用（用量/耗时/成败），并返回本次的汇总。
+
+        汇总只统计接口**真实返回**的 token：缺失的字段按「未知」处理，
+        不参与求和，避免把未知当成 0 拉低平均值。若全部记录都没有用量，
+        返回的 total_tokens 为 None 而不是 0。
+
+        参数:
+            records: observability.invoke_llm 产出的记录列表。
+
+        返回:
+            汇总字典 {calls, failed, total_tokens, duration_ms}。
+        """
+        records = records or []
+        summary = {"calls": 0, "failed": 0, "total_tokens": None, "duration_ms": 0}
+        for rec in records:
+            summary["calls"] += 1
+            success = bool(rec.get("success", False))
+            if not success:
+                summary["failed"] += 1
+            summary["duration_ms"] += int(rec.get("duration_ms") or 0)
+            tokens = rec.get("total_tokens")
+            if isinstance(tokens, int):
+                summary["total_tokens"] = (summary["total_tokens"] or 0) + tokens
+
+            if not self._db_ok():
+                continue
+            try:
+                self._repo.add_llm_call(
+                    run_id=self.run_id,
+                    node=str(rec.get("node", "")),
+                    model=str(rec.get("model", "")),
+                    input_tokens=rec.get("input_tokens"),
+                    output_tokens=rec.get("output_tokens"),
+                    total_tokens=rec.get("total_tokens"),
+                    duration_ms=int(rec.get("duration_ms") or 0),
+                    attempts=int(rec.get("attempts") or 1),
+                    status="success" if success else "failed",
+                    error_message=rec.get("error"),
+                )
+            except Exception as e:  # noqa: BLE001 —— 记录失败不影响分析
+                logger.warning("记录 LLM 调用失败：%s", e)
+        return summary
 
     def record_result(self, result_type: str, content: dict | None) -> None:
         """直接记录一条结构化分析结果（非工具触发的场景使用）。"""
@@ -245,22 +294,46 @@ class PersistenceService:
             logger.warning("记录报告失败：%s", e)
 
     # ---- 完成 ----
-    def complete(self, status: str = "completed", error: str | None = None, step_count: int | None = None) -> None:
+    def complete(
+        self,
+        status: str = "completed",
+        error: str | None = None,
+        step_count: int | None = None,
+        llm_calls: dict | None = None,
+    ) -> None:
         """收尾：把任务与运行置为终态，并同步 Redis 会话状态。
 
         参数:
             status: 终态，completed 或 failed。
             error: 失败原因；成功时为 None。
             step_count: 本次运行总步数，可选。
+            llm_calls: record_llm_calls 产出的汇总（调用次数/失败次数/token 合计），
+                可选；用于把运行级指标一次性写进 agent_runs。
         """
+        # 运行总耗时：自 start_run 起算（未 start 过则为 0）
+        duration_ms = (
+            int((_now() - self._started_at).total_seconds() * 1000)
+            if self._started_at is not None
+            else 0
+        )
         if self._db_ok():
             try:
                 if self.task_id is not None:
                     self._repo.update_task(self.task_id, status=status, error_message=error)
                 if self.run_id is not None:
-                    fields: dict = {"status": status, "error_message": error}
+                    fields: dict = {
+                        "status": status,
+                        "error_message": error,
+                        "duration_ms": duration_ms,
+                    }
                     if step_count is not None:
                         fields["step_count"] = step_count
+                    if llm_calls:
+                        fields["llm_call_count"] = llm_calls.get("calls", 0)
+                        fields["llm_failed_count"] = llm_calls.get("failed", 0)
+                        # 接口未返回用量时保持 None，不写入 0（避免读成「零消耗」）
+                        if llm_calls.get("total_tokens") is not None:
+                            fields["total_tokens"] = llm_calls["total_tokens"]
                     self._repo.update_run(self.run_id, **fields)
             except Exception as e:  # noqa: BLE001
                 logger.warning("更新 task/run 完成状态失败：%s", e)

@@ -34,7 +34,8 @@ def retrieve_knowledge(query: str, top_k: int = 0) -> str:
         # top_k 为 0/缺省时回落到全局配置的检索条数
         k = top_k or get_settings().rag_top_k
         # 检索器为单例：内部封装 embedding 与向量库（pgvector 或内存）
-        results = get_retriever().retrieve(query, k)
+        retriever = get_retriever()
+        results = retriever.retrieve(query, k)
     except Exception as e:  # noqa: BLE001
         return f"知识库检索失败：{type(e).__name__}: {e}"
 
@@ -46,4 +47,14 @@ def retrieve_knowledge(query: str, top_k: int = 0) -> str:
     for r in results:
         cat = r["metadata"].get("category", "?")
         lines.append(f"[{cat}] (相似度 {r['score']}) {r['text'][:240]}")
+
+    # 如实标注检索方式：离线词法向量只做字面匹配，结论不应被当作语义检索的结果。
+    # 没有这行提示，模型容易把「恰好字面重合」当成「语义相关」。
+    embedder = getattr(retriever, "embedder", None)
+    if embedder is not None and not getattr(embedder, "is_semantic", True):
+        lines.append(
+            f"\n[检索方式] 当前使用 {getattr(embedder, 'name', '未知')} "
+            "离线词法向量（非语义模型），仅按字面重合度排序。"
+            "若结果与问题明显无关，请忽略这些片段，不要强行引用。"
+        )
     return "\n\n".join(lines)

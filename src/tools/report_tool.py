@@ -16,6 +16,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from src.config.settings import get_settings
+from src.tools.errors import KIND_EXECUTION_ERROR, tool_error
 
 
 def save_report_file(content: str, title: str = "") -> str:
@@ -48,11 +49,14 @@ def save_report(content: str, title: str = "") -> str:
     """将 Markdown 格式的分析报告保存到 reports/ 目录，返回保存路径。
 
     返回值：
-        str: 成功提示（含路径）；写盘异常时返回 "报告保存失败：..." 字符串，
-        不向上抛异常。
+        str: 成功提示（含路径）；写盘异常时返回结构化错误文本，不向上抛异常。
     """
     try:
         out = save_report_file(content, title)
         return f"报告已保存: {out}"
-    except Exception as e:
-        return f"报告保存失败：{type(e).__name__}: {e}"
+    except Exception as e:  # noqa: BLE001 —— 工具层不抛异常
+        return tool_error(
+            KIND_EXECUTION_ERROR,
+            f"报告保存失败：{type(e).__name__}: {e}",
+            hint="请检查 reports/ 目录是否可写、磁盘是否已满。",
+        )

@@ -119,8 +119,42 @@ def session_scope():
         session.close()  # 关闭 Session，连接归还连接池
 
 
+# 轻量迁移语句：create_all 只会**新建缺失的表**，不会给已存在的表补列。
+# 对于新增字段（如 tool_calls.duration_ms），老库升级后会因缺列而写库失败，
+# 因此这里显式补一次。语句本身幂等（IF NOT EXISTS），可安全重复执行。
+_LIGHT_MIGRATIONS = (
+    "ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS duration_ms INTEGER DEFAULT 0",
+    "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS llm_call_count INTEGER DEFAULT 0",
+    "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS llm_failed_count INTEGER DEFAULT 0",
+    "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS total_tokens INTEGER",
+    "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS duration_ms INTEGER DEFAULT 0",
+)
+
+
+def _apply_light_migrations(eng) -> None:
+    """为已存在的表补齐新增列（仅 PostgreSQL；SQLite 由 create_all 全新建表）。
+
+    说明：本项目没有引入 Alembic 这类完整迁移框架——那对当前的规模属于过度
+    设计。这里只处理「加列」这一种向后兼容的变更；一旦出现改类型、拆表这类
+    破坏性变更，应改用正式迁移工具。
+
+    参数:
+        eng: 目标数据库引擎。
+    """
+    # SQLite 等方言不支持 ADD COLUMN IF NOT EXISTS；测试库每次都是全新建表，
+    # 因此这里只对 PostgreSQL 执行，避免制造方言兼容问题
+    if eng.dialect.name != "postgresql":
+        return
+    try:
+        with eng.begin() as conn:
+            for stmt in _LIGHT_MIGRATIONS:
+                conn.execute(text(stmt))
+    except Exception as e:  # noqa: BLE001 —— 迁移失败不应阻断启动，交由后续写入报错暴露
+        logger.warning("轻量迁移执行失败（可能是权限不足）：%s", e)
+
+
 def init_db(engine=None) -> None:
-    """创建数据库表（幂等，不删除已有数据）。
+    """创建数据库表并补齐新增列（幂等，不删除已有数据）。
 
     参数:
         engine: 可选的目标引擎；不传则使用全局引擎。
@@ -128,6 +162,7 @@ def init_db(engine=None) -> None:
     """
     eng = engine or get_engine()
     Base.metadata.create_all(eng)
+    _apply_light_migrations(eng)
 
 
 def is_db_available() -> bool:

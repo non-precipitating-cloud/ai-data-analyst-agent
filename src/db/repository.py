@@ -16,6 +16,7 @@ from src.db.models import (
     AnalysisResult,
     AnalysisTask,
     Dataset,
+    LLMCall,
     Report,
     ToolCall,
 )
@@ -162,6 +163,7 @@ class Repository:
         result: str | None,
         status: str,
         error_message: str | None = None,
+        duration_ms: int = 0,
     ) -> int:
         """插入一条工具调用记录。
 
@@ -171,8 +173,9 @@ class Repository:
             tool_type: 工具类型（local/mcp）。
             arguments: 调用参数字典（存 JSON）。
             result: 已截断的结果字符串。
-            status: 调用状态（success/failed 等）。
+            status: 调用状态（success/error 等）。
             error_message: 失败时的错误信息。
+            duration_ms: 本次调用耗时（毫秒），用于定位慢工具。
 
         返回:
             新建工具调用记录的主键 ID。
@@ -186,10 +189,57 @@ class Repository:
                 result_json=result,
                 status=status,
                 error_message=error_message,
+                duration_ms=duration_ms,
             )
             s.add(tc)
             s.flush()
             return tc.id
+
+    def add_llm_call(
+        self,
+        run_id: int | None,
+        node: str,
+        model: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_tokens: int | None,
+        duration_ms: int,
+        attempts: int,
+        status: str,
+        error_message: str | None = None,
+    ) -> int:
+        """插入一条大模型调用记录。
+
+        参数:
+            run_id: 所属运行 ID，可为 None。
+            node: 发起调用的节点名。
+            model: 模型名。
+            input_tokens / output_tokens / total_tokens: 接口返回的真实用量；
+                接口未提供时传 None（不估算）。
+            duration_ms: 本次调用耗时（含重试等待）。
+            attempts: 实际尝试次数。
+            status: success / failed。
+            error_message: 失败原因。
+
+        返回:
+            新建记录的主键 ID。
+        """
+        with session_scope() as s:
+            row = LLMCall(
+                run_id=run_id,
+                node=node,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                duration_ms=duration_ms,
+                attempts=attempts,
+                status=status,
+                error_message=error_message,
+            )
+            s.add(row)
+            s.flush()
+            return row.id
 
     def add_result(self, task_id: int | None, result_type: str, content: dict | None) -> int:
         """插入一条结构化分析结果。
@@ -256,6 +306,15 @@ class Repository:
             return list(
                 s.execute(
                     select(ToolCall).where(ToolCall.run_id == run_id).order_by(ToolCall.id)
+                ).scalars()
+            )
+
+    def list_llm_calls(self, run_id: int) -> list[LLMCall]:
+        """查询某次运行下的全部 LLM 调用，按调用先后（ID 升序）排列。"""
+        with session_scope() as s:
+            return list(
+                s.execute(
+                    select(LLMCall).where(LLMCall.run_id == run_id).order_by(LLMCall.id)
                 ).scalars()
             )
 

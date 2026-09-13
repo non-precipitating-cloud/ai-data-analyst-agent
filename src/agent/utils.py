@@ -1,8 +1,9 @@
 """Agent 通用工具函数模块。
 
-存放与具体节点业务无关、被多处复用的小工具：LLM 输出的容错 JSON 解析
-与长文本截断。planner、insight、report 等节点都依赖这里的能力来应对
-大模型输出不规范、上下文过长等常见问题。
+存放与具体节点业务无关、被多处复用的小工具：LLM 输出的容错 JSON 解析、
+长文本截断，以及送入 LLM 前的对话历史裁剪。task_understanding、planner、
+insight、report、tool_calling 等节点都依赖这里的能力来应对大模型输出不
+规范、上下文过长等常见问题。
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+
+from langchain_core.messages import BaseMessage, ToolMessage
 
 
 def parse_json(text: str) -> Any:
@@ -71,3 +74,74 @@ def truncate(text: str, limit: int = 6000) -> str:
         return text
     # 截断处附上原始长度，便于在日志/报告中意识到内容被裁过
     return text[:limit] + f"\n...(截断，原长度 {len(text)} 字符)"
+
+
+def trim_messages_for_llm(
+    messages: list[BaseMessage], *, keep_recent_tool_results: int = 6
+) -> list[BaseMessage]:
+    """裁剪送入 LLM 的对话历史，控制单次请求的上下文规模。
+
+    为什么需要：agent ⇄ tools 循环每一轮都会把**完整历史**重新发给模型，
+    而每条工具结果可达数千字符。跑到第十几轮时，请求体里绝大部分是重复的
+    旧工具输出——既持续消耗 token，也逼近模型的上下文上限，反而挤掉了真正
+    重要的近期信息。
+
+    裁剪策略（保守，只动最冗余的部分）：
+    - SystemMessage / HumanMessage（系统人设与用户需求）永远保留；
+    - AIMessage 的**决策内容**全部保留：它记录了 Agent 每一步的选择，
+      去掉会让模型对自己的推理链失去连续性；
+    - ToolMessage 只保留最近 ``keep_recent_tool_results`` 条的原文，
+      更早的替换为一行占位说明（保留工具名，便于模型知道「做过什么」）。
+
+    这样既压缩了体积，又不会让模型误以为某些步骤从未执行过。
+
+    :param messages: 原始消息列表
+    :param keep_recent_tool_results: 保留原文的最近工具结果条数
+    :return: 裁剪后的新列表（不修改入参）
+    """
+    if not messages:
+        return []
+
+    # 先定位所有 ToolMessage 的下标，只有它们会被替换
+    tool_indexes = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+    # 最近 N 条以内的保持原样
+    keep_from = len(tool_indexes) - max(keep_recent_tool_results, 0)
+    stale_indexes = set(tool_indexes[:keep_from]) if keep_from > 0 else set()
+
+    if not stale_indexes:
+        return list(messages)
+
+    trimmed: list[BaseMessage] = []
+    for i, m in enumerate(messages):
+        if i in stale_indexes:
+            # 占位消息保留工具名与原文长度，让模型知道该步骤存在过但内容已折叠
+            name = getattr(m, "name", "") or "工具"
+            length = len(str(getattr(m, "content", "")))
+            trimmed.append(
+                ToolMessage(
+                    content=(
+                        f"[历史工具结果已折叠] {name} 曾在更早的步骤返回约 {length} 字符的结果。"
+                        "如需该数据，请重新调用对应工具。"
+                    ),
+                    tool_call_id=getattr(m, "tool_call_id", ""),
+                    name=getattr(m, "name", None),
+                )
+            )
+        else:
+            trimmed.append(m)
+    return trimmed
+
+
+def build_degradation_note(degraded: list[str]) -> str:
+    """把降级原因列表渲染成人类可读的说明段落。
+
+    降级（LLM 不可用、步数耗尽、工具反复失败）会直接影响结论的完整性，
+    必须显式写进报告，避免读者把「没分析出来」误读成「没有问题」。
+
+    :param degraded: 降级原因列表
+    :return: 每条一行的说明文本；无降级时返回空串
+    """
+    if not degraded:
+        return ""
+    lines = "\n".join(f"- {d}" for d in degraded)
+    return f"本次分析存在以下降级/未完成情况：\n{lines}"
